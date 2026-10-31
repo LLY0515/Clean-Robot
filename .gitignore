@@ -1,0 +1,17 @@
+# colcon 构建产物（重新 build 即可生成，不应入库）
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE / 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 本机临时日志
+*.log
