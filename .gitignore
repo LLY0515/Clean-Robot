@@ -15,3 +15,8 @@ __pycache__/
 
 # 本机临时日志
 *.log
+
+# FAST-LIO 运行时产物（每次跑 fastlio_mapping 往源码目录里写日志/点云，动辄 MB 级）
+src/fast_lio/Log/*.txt
+src/fast_lio/PCD/
+*.pcd

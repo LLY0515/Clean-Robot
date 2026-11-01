@@ -183,8 +183,8 @@
        - 点云发布在 /livox/lidar（frame: livox），由 launch 里的
          pointcloud_to_laserscan 节点转成 /scan（LaserScan）供 Nav2 使用。
        - 该宏还顺带生成内置 IMU（link: livox_imu，话题 /livox/imu），
-         EKF 的 imu0 已改为订阅它（见 config/ekf.yaml）；原独立的 imu_link
-         （/demo/imu）已从本文件删除，机器人 IMU 完全由 Mid-360 提供。
+         由 FAST-LIO 订阅（与 /livox/lidar 一起做 LiDAR+IMU 紧耦合）；原独立的
+         imu_link（/demo/imu）已从本文件删除，机器人 IMU 完全由 Mid-360 提供。
        - 雷达装在 base_link 正上方 0.12 m（与原 lidar 安装位置一致）。
        ============================================================ -->
   <xacro:mid360 name="livox" parent="base_link">

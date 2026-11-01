@@ -1,0 +1,89 @@
+# slam_toolbox 在线异步建图参数（供 build_map.sh 使用）
+# 基于 slam_toolbox 官方 mapper_params_online_async.yaml，针对本项目做了两处调整：
+#   1. max_laser_range: 15.0 —— 与 Mid-360 仿真的量程一致（官方默认 20.0）
+#   2. 坐标系/话题已匹配本项目：odom_frame=odom、base_frame=base_footprint、scan_topic=/scan
+
+slam_toolbox:
+  ros__parameters:
+
+    # Plugin params
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
+    ceres_trust_strategy: LEVENBERG_MARQUARDT
+    ceres_dogleg_type: TRADITIONAL_DOGLEG
+    ceres_loss_function: None
+
+    # ROS Parameters
+    odom_frame: odom
+    map_frame: map
+    base_frame: base_footprint
+    scan_topic: /scan
+    use_map_saver: true
+    mode: mapping #localization
+
+    # if you'd like to immediately start continuing a map at a given pose
+    # or at the dock, but they are mutually exclusive, if pose is given
+    # will use pose
+    #map_file_name: test_steve
+    # map_start_pose: [0.0, 0.0, 0.0]
+    #map_start_at_dock: true
+
+    debug_logging: false
+    throttle_scans: 1
+    transform_publish_period: 0.02 #if 0 never publishes odometry
+    map_update_interval: 5.0
+    resolution: 0.05
+    min_laser_range: 0.0 #for rastering images
+    max_laser_range: 15.0 #for rastering images（与 Mid-360 量程一致）
+    minimum_time_interval: 0.5
+    # 【关键】FAST-LIO 发布 odom->base_link 有约 0.2 s 处理延迟：/scan 的时间戳
+    # 比缓冲区里最新的 TF 还要新 ~0.19 s。官方默认 transform_timeout=0.2 刚好卡在
+    # 边界上，slam_toolbox 的 tf2 MessageFilter 查不到 TF 就把消息堆在队列里，
+    # 队列一满就打印 "Message Filter dropping message ... queue is full" 并丢帧，
+    # 结果地图几乎不更新（实测开车 1.8 m 地图只长 3 格）。
+    # 这里把等待容忍度和队列深度都放大，让过滤器能等 TF 到达。
+    transform_timeout: 1.0
+    scan_queue_size: 30
+    tf_buffer_duration: 30.
+    stack_size_to_use: 40000000 #// program needs a larger stack size to serialize large maps
+    enable_interactive_mode: true
+
+    # General Parameters
+    use_scan_matching: true
+    use_scan_barycenter: true
+    minimum_travel_distance: 0.5
+    minimum_travel_heading: 0.5
+    scan_buffer_size: 10
+    scan_buffer_maximum_scan_distance: 10.0
+    link_match_minimum_response_fine: 0.1
+    link_scan_maximum_distance: 1.5
+    loop_search_maximum_distance: 3.0
+    do_loop_closing: true
+    loop_match_minimum_chain_size: 10
+    loop_match_maximum_variance_coarse: 3.0
+    loop_match_minimum_response_coarse: 0.35
+    loop_match_minimum_response_fine: 0.45
+
+    # Correlation Parameters - Correlation Parameters
+    correlation_search_space_dimension: 0.5
+    correlation_search_space_resolution: 0.01
+    correlation_search_space_smear_deviation: 0.1
+
+    # Correlation Parameters - Loop Closure Parameters
+    loop_search_space_dimension: 8.0
+    loop_search_space_resolution: 0.05
+    loop_search_space_smear_deviation: 0.03
+
+    # Scan Matcher Parameters
+    distance_variance_penalty: 0.5
+    angle_variance_penalty: 1.0
+
+    fine_search_angle_offset: 0.00349
+    coarse_search_angle_offset: 0.349
+    coarse_angle_resolution: 0.0349
+    minimum_angle_penalty: 0.9
+    minimum_distance_penalty: 0.5
+    use_response_expansion: true
+    min_pass_through: 2
+    occupancy_threshold: 0.1

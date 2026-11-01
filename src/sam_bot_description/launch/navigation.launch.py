@@ -12,6 +12,7 @@ def generate_launch_description():
     pkg_share = get_package_share_directory('sam_bot_description')
     pkg_gazebo_ros = get_package_share_directory('gazebo_ros')
     pkg_nav2_bringup = get_package_share_directory('nav2_bringup')
+    pkg_fast_lio_share = get_package_share_directory('fast_lio')
 
     # ================= 2. 定义文件路径 =================
     # 你的 URDF 模型路径 (安装后位于 share/<pkg>/description/ 下)
@@ -22,6 +23,8 @@ def generate_launch_description():
     map_file = os.path.join(pkg_share, 'map', 'my_map.yaml')
     # 你的 Nav2 参数文件
     param_file = os.path.join(pkg_share, 'config', 'nav2_params.yaml')
+    # FAST-LIO 参数文件（仿真专用：lidar_type=4 走标准 PointCloud2 输入）
+    fastlio_config = os.path.join(pkg_fast_lio_share, 'config', 'mid360_sim.yaml')
     
     # 使用 Nav2 官方自带的 RViz 配置文件（它已经配置好了所有代价地图、路径等显示项）
     rviz_config_file = os.path.join(pkg_nav2_bringup, 'rviz', 'nav2_default_view.rviz')
@@ -71,15 +74,17 @@ def generate_launch_description():
         output='screen'
     )
 
-    # (4.5) 启动 robot_localization EKF：URDF 里 diff_drive 的 publish_odom_tf=false，
-    #       必须由 EKF 融合里程计 + IMU 发布 odom->base_link 的 TF，
-    #       否则 AMCL / 代价地图拿不到 odom->base_link，导航无法定位。
-    ekf_node = Node(
-        package='robot_localization',
-        executable='ekf_node',
-        name='ekf_filter_node',
+    # (4.5) FAST-LIO：LiDAR + IMU 紧耦合里程计（替代原 robot_localization EKF）。
+    #       fastlio_mapping 发布 odom->base_link 的 TF（源码已把 camera_init->odom、body->base_link），
+    #       AMCL 继续负责 map->odom，两者解耦：里程计由 FAST-LIO 提供，全局定位由 AMCL 提供。
+    #       注意：/demo/odom（轮式里程计）仍保留，供 Nav2 的 controller/velocity_smoother
+    #       读取速度反馈（nav2_params.yaml 里 odom_topic 仍指向 /demo/odom）。
+    fastlio_node = Node(
+        package='fast_lio',
+        executable='fastlio_mapping',
+        name='fastlio_mapping',
         output='screen',
-        parameters=[os.path.join(pkg_share, 'config', 'ekf.yaml'), {'use_sim_time': use_sim_time}]
+        parameters=[fastlio_config, {'use_sim_time': use_sim_time}]
     )
 
     # (4.6) 【改动】把 Mid-360 的 3D 点云 (/livox/lidar) 投影成 2D 激光扫描 (/scan)，
@@ -149,7 +154,7 @@ def generate_launch_description():
         gzclient,
         robot_state_publisher,
         spawn_entity,
-        ekf_node,
+        fastlio_node,
         pointcloud_to_laserscan,
         nav2_bringup,
         rviz2

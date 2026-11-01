@@ -21,9 +21,13 @@
   <xacro:property name="laser_min_range" value="0.1"/>      <!-- 最小测距: 0.1m -->
   <xacro:property name="laser_max_range" value="15.0"/>    <!-- 最大测距: 15m（之前误设为 5.0，导致 4.9m 的墙被截断）-->
 
-  <!-- 点云速率参数 (基于官方规格: 200,000 points/s) -->
-  <!-- 仿真中降低点云速率以提高性能，实际设备为200000 -->
-  <xacro:property name="point_rate" value="200000"/>        <!-- 仿真点云速率: 10,000 points/s -->
+  <!-- 点云速率参数 -->
+  <!-- 实际设备为 200,000 points/s。CPU 射线投射 (ODE) 每帧 2 万条射线会把 gzserver
+       打到 ~92% CPU 且每帧耗时数十秒。保留 point_rate=200000 是为了让每帧覆盖
+       CSV 的 2 万个方位角点（约 360° 全向），再用 downsample 把实际射线数降到 ~1000 条。
+       若把 point_rate 降到 2 万，每帧只覆盖 ~51° 方位角，导致点云只看到一小块扇形，
+       FAST-LIO 报 "Too few input point cloud!"、AMCL 看不到墙面。 -->
+  <xacro:property name="point_rate" value="200000"/>       <!-- 仿真点云速率: 200,000 points/s (全向覆盖) -->
   <xacro:property name="update_rate" value="10"/>   <!-- 默认发布频率: 10Hz -->
   <xacro:property name="resolution" value="0.002"/>         <!-- 测距分辨率: 2mm -->
 
@@ -157,6 +161,10 @@
       <sensor type="ray" name="${name}">
         <pose>0 0 0 0 0 0</pose>
         <visualize>true</visualize>
+        <!-- 关键：IMU 有 always_on 所以能持续发布；激光雷达缺少它，传感器默认不激活，
+             只在有 Gazebo 传输订阅者时短暂激活，导致 /livox/lidar 几乎不发数据。
+             加上 always_on 让射线传感器持续更新，FAST-LIO/AMCL 才能收到点云。 -->
+        <always_on>true</always_on>
         <update_rate>${update_rate}</update_rate>
 
         <!-- Mid-360 点云仿真插件 -->
@@ -203,7 +211,9 @@
           <samples>${point_rate / update_rate}</samples>
           <!-- 降采样因子: 减少实际射线数量以提高性能 -->
           <!-- 实际射线数 = samples / downsample, 值越大性能越好但精度越低 -->
-          <downsample>1</downsample>
+          <!-- samples=200000/10=20000（全向覆盖），downsample=20 → 20000/20=1000 条射线/帧，
+               既覆盖 360° 又避免 CPU 射线投射过慢。 -->
+          <downsample>20</downsample>
           <csv_file_name>$(find mid360_simulation)/scan_mode/mid360.csv</csv_file_name>
           <topic>${lidar_topic}</topic>
 

@@ -5,8 +5,12 @@ set -e
 cd "$(dirname "$0")"
 
 # 清理之前残留的进程
+# 【改动】补上可能残留的 slam_toolbox / fastlio_mapping / pointcloud_to_laserscan：
+#   之前 build_map.sh（或手动起的 slam_toolbox）退出不干净时，残留的 slam_toolbox
+#   会和 Nav2 的 map_server 同时往 /map 发数据，表现为"导航时地图还在边开边长"，
+#   看起来像还在建图。
 echo "清理残留进程..."
-pkill -9 -f "gzserver|gzclient|gazebo|robot_state_publisher|ekf_node|component_container|rviz2|joint_state_publisher|spawn_entity|ros2 launch sam_bot_description" 2>/dev/null || true
+pkill -9 -f "gzserver|gzclient|gazebo|robot_state_publisher|component_container|rviz2|joint_state_publisher|spawn_entity|slam_toolbox|fastlio_mapping|pointcloud_to_laserscan|teleop_twist_keyboard|map_saver|ros2 launch sam_bot_description" 2>/dev/null || true
 sleep 2
 
 # source 环境

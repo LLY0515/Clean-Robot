@@ -6,6 +6,8 @@ import os
 
 def generate_launch_description():
     pkg_share = launch_ros.substitutions.FindPackageShare(package='sam_bot_description').find('sam_bot_description')
+    pkg_fast_lio_share = launch_ros.substitutions.FindPackageShare(package='fast_lio').find('fast_lio')
+    fastlio_config = os.path.join(pkg_fast_lio_share, 'config', 'mid360_sim.yaml')
     default_model_path = os.path.join(pkg_share, 'description/sam_bot_description.urdf')
     default_rviz_config_path = os.path.join(pkg_share, 'rviz/urdf_config.rviz')
     world_path = os.path.join(pkg_share, 'world/my_world.sdf')
@@ -42,12 +44,13 @@ def generate_launch_description():
         output='screen'
     )
 
-    robot_localization_node = launch_ros.actions.Node(
-       package='robot_localization',
-       executable='ekf_node',
-       name='ekf_filter_node',
-       output='screen',
-       parameters=[os.path.join(pkg_share, 'config/ekf.yaml'), {'use_sim_time': LaunchConfiguration('use_sim_time')}]
+    # FAST-LIO：LiDAR+IMU 紧耦合里程计（替代原 robot_localization EKF），发布 odom->base_link TF
+    fastlio_node = launch_ros.actions.Node(
+        package='fast_lio',
+        executable='fastlio_mapping',
+        name='fastlio_mapping',
+        output='screen',
+        parameters=[fastlio_config, {'use_sim_time': LaunchConfiguration('use_sim_time')}]
     )
 
     # 【改动】把 Mid-360 的 3D 点云 (/livox/lidar) 投影成 2D 激光扫描 (/scan)。
@@ -93,7 +96,7 @@ def generate_launch_description():
         joint_state_publisher_node,
         robot_state_publisher_node,
         spawn_entity,
-        robot_localization_node,
+        fastlio_node,
         pointcloud_to_laserscan_node,
         rviz_node
     ])
