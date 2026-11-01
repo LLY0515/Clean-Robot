@@ -407,14 +407,14 @@ xacro 支持 `+ - * /` 和常用函数（如 `${pi}`）。
 写完先本地验证能否展开：
 
 ```bash
-xacro src/description/sam_bot.urdf.xacro
+xacro src/sam_bot_description/description/sam_bot.urdf.xacro
 ```
 
 能打印出完整 URDF 且无报错，再往下走。
 
 ### 7.2 launch 文件
 
-本项目的 [display.launch.py](../src/launch/display.launch.py) 已经做了核心几件事：
+本项目的 [display.launch.py](../src/sam_bot_description/launch/display.launch.py) 已经做了核心几件事：
 
 ```python
 parameters=[{'robot_description': Command(['xacro ', LaunchConfiguration('model')])}]

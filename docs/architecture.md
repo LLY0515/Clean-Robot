@@ -39,11 +39,11 @@ sam_bot_description/
 │   │   └── nav2_params.yaml            # Nav2 全套导航参数
 │   ├── rviz/
 │   │   └── urdf_config.rviz            # display.launch.py 用的 RViz 配置
-│   └── world/
-│       └── my_world.sdf                # Gazebo 世界（围墙 + 障碍物）
-├── map/
-│   ├── my_map.yaml                     # 地图元数据（分辨率/原点）
-│   └── my_map.pgm                      # 地图栅格图像（占用网格）
+│   ├── world/
+│   │   └── my_world.sdf                # Gazebo 世界（围墙 + 障碍物）
+│   └── map/
+│       ├── my_map.yaml                 # 地图元数据（分辨率/原点）
+│       └── my_map.pgm                  # 地图栅格图像（占用网格）
 └── install/                            # colcon 安装产物（构建后生成）
 ```
 
@@ -63,7 +63,7 @@ sam_bot_description/
 
 ## 2. 机器人模型构建（URDF）
 
-文件：`src/description/sam_bot_description.urdf`（xacro 格式，根元素带 `xmlns:xacro`）。
+文件：`src/sam_bot_description/description/sam_bot_description.urdf`（xacro 格式，根元素带 `xmlns:xacro`）。
 
 ### 2.1 xacro 常量与宏
 
@@ -87,8 +87,8 @@ sam_bot_description/
 | `base_footprint` | 空 link | 地面投影点（2D 导航基准） |
 | `drivewhl_l_link` / `drivewhl_r_link` | 圆柱 r=0.10，0.5 kg | 左右驱动轮 |
 | `front_caster` | 球 r≈0.06，0.5 kg | 前万向轮（摩擦设 0） |
-| `imu_link` | 0.1 箱体，0.1 kg | IMU 安装点 |
-| `lidar_link` | 圆柱 r=0.0508，0.125 kg | 激光雷达安装点 |
+| `livox_imu` | 空 link（无质量/惯量） | Mid-360 内置 IMU 坐标系 |
+| `livox` | STL 网格，0.265 kg | Mid-360 激光雷达 |
 | `camera_link` | 0.015×0.130×0.022 箱体 | 深度相机安装点 |
 | `camera_depth_frame` | 空 link | 相机光学坐标系 |
 
@@ -100,8 +100,8 @@ sam_bot_description/
 | `drivewhl_l_joint` | **continuous** | base_link → drivewhl_l_link | 左轮，转轴 (0,1,0) |
 | `drivewhl_r_joint` | **continuous** | base_link → drivewhl_r_link | 右轮，转轴 (0,1,0) |
 | `caster_joint` | fixed | base_link → front_caster | 前万向轮 |
-| `imu_joint` | fixed | base_link → imu_link | z +0.01 |
-| `lidar_joint` | fixed | base_link → lidar_link | z +0.12 |
+| `livox_imu_joint` | fixed | livox → livox_imu | (0.011, 0.02329, −0.04412) |
+| `livox_joint` | fixed | base_link → livox | z +0.12 |
 | `camera_joint` | fixed | base_link → camera_link | (0.215, 0, 0.05) |
 | `camera_depth_joint` | fixed | camera_link → camera_depth_frame | 相机光轴旋转 |
 
@@ -116,8 +116,8 @@ URDF 里的 `<gazebo>` 标签在机器人被 spawn 进 Gazebo 时生效，每个
 | 插件 | 加载库 | 发布/订阅 | 作用 |
 |------|--------|----------|------|
 | diff_drive | `libgazebo_ros_diff_drive.so` | 订 `/cmd_vel`，发 `/demo/odom` | 差速驱动 + 轮式里程计 |
-| imu_sensor | `libgazebo_ros_imu_sensor.so` | 发 `/demo/imu`（100 Hz） | IMU（角速度+线加速度） |
-| ray_sensor（激光） | `libgazebo_ros_ray_sensor.so` | 发 `/scan`（15 Hz） | 360 线激光雷达 |
+| imu_sensor | `libgazebo_ros_imu_sensor.so` | 发 `/livox/imu`（200 Hz） | Mid-360 内置 IMU（角速度+线加速度） |
+| mid360 点云 | `libmid360_plugin.so` | 发 `/livox/lidar`（PointCloud2，10 Hz） | Mid-360 非重复扫描 3D 点云 |
 | camera（深度） | `libgazebo_ros_camera.so` | 发 `/depth_camera/*` | 深度相机 |
 | joint_state_publisher | `libgazebo_ros_joint_state_publisher.so` | 发 `/joint_states`（30 Hz） | 轮子真实转角 |
 
@@ -148,19 +148,19 @@ URDF 里的 `<gazebo>` 标签在机器人被 spawn 进 Gazebo 时生效，每个
 
 ### 3.2 IMU 传感器
 
-- 命名空间 `/demo`，发布 `/demo/imu`（`sensor_msgs/Imu`）。
-- 配置了高斯噪声（角速度 stddev 2e-4、线加速度 stddev 1.7e-2）和 bias，模拟真实 IMU 误差。
+- 内置于 Mid-360，命名空间 `/`，发布 `/livox/imu`（`sensor_msgs/Imu`，200 Hz）。
+- 配置了高斯噪声（角速度 stddev 1e-5、线加速度 stddev 1e-4），模拟真实 BMI088 IMU 误差。
 
 ### 3.3 激光雷达
 
-- 发布 `/scan`（`sensor_msgs/LaserScan`），`frame_name: lidar_link`。
-- 360 个采样点、量程 0.12~3.5 m、分辨率 0.015 m，匹配 Nav2 里的 `laser_max_range: 3.5`。
+- 发布 `/livox/lidar`（`sensor_msgs/PointCloud2`，10 Hz），`frame_id: livox`，由 `libmid360_plugin.so` 按 `mid360.csv` 定义的非重复扫描轨迹生成 3D 点云，量程 0.1~5.0 m。
+- Nav2 只认 2D 激光，故 launch 里另起 `pointcloud_to_laserscan` 节点把 `/livox/lidar` 投影成 `/scan`（`LaserScan`，frame `base_link`，10 Hz，量程 0.1~5.0 m）。
 
 ---
 
 ## 4. 里程计与 IMU 数据融合（EKF）
 
-文件：`src/config/ekf.yaml`，由 `navigation.launch.py` 启动 `ekf_filter_node`（robot_localization）。
+文件：`src/sam_bot_description/config/ekf.yaml`，由 `navigation.launch.py` 启动 `ekf_filter_node`（robot_localization）。
 
 ### 4.1 为什么需要 EKF
 
@@ -188,7 +188,7 @@ odom0_config: [true, true, false,   # x, y 位置融合
                false, false, true,  # yaw 角速度融合
                false, false, false] # 加速度不融合
 
-imu0: demo/imu                # IMU
+imu0: livox/imu                # IMU
 imu0_config: [false, false, false, # 位置不融合
               false, false, true,  # yaw 姿态融合（关键）
               false, false, false, # 线速度不融合
@@ -224,8 +224,8 @@ map ──► odom ──► base_link ──► base_footprint
                         ├──► drivewhl_l_link
                         ├──► drivewhl_r_link
                         ├──► front_caster
-                        ├──► imu_link
-                        ├──► lidar_link
+                        ├──► livox_imu
+                        ├──► livox
                         └──► camera_link ──► camera_depth_frame
 ```
 
@@ -257,7 +257,7 @@ AMCL 发布的 `map → odom` 变换，就是"把会漂移的 odom 坐标系对�
 
 ## 6. 建图（SLAM → 地图保存）
 
-> 说明：原 `src/config/slam.yaml` 已删除（本项目当前用预建地图导航，不再走 SLAM）。以下是历史建图流程，用于说明地图从哪来。
+> 说明：原 `src/sam_bot_description/config/slam.yaml` 已删除（本项目当前用预建地图导航，不再走 SLAM）。以下是历史建图流程，用于说明地图从哪来。
 
 ### 6.1 建图流程
 
@@ -266,7 +266,7 @@ AMCL 发布的 `map → odom` 变换，就是"把会漂移的 odom 坐标系对�
 3. 手动控制机器人（如 `teleop_twist_keyboard` 发 `/cmd_vel`）遍历环境；
 4. 用 `nav2_map_server` 的 `map_saver` 把 `/map` 保存成文件。
 
-### 6.2 地图文件（map/my_map.yaml）
+### 6.2 地图文件（src/sam_bot_description/map/my_map.yaml）
 
 ```yaml
 image: my_map.pgm
@@ -286,7 +286,7 @@ free_thresh: 0.25
 
 ## 7. 导航规划（Nav2）
 
-导航由 `navigation.launch.py` 调用 `nav2_bringup` 的 `bringup_launch.py` 启动，参数全部在 `src/config/nav2_params.yaml`。
+导航由 `navigation.launch.py` 调用 `nav2_bringup` 的 `bringup_launch.py` 启动，参数全部在 `src/sam_bot_description/config/nav2_params.yaml`。
 
 ### 7.1 Nav2 各节点职责
 
@@ -337,7 +337,7 @@ behavior_server(恢复行为) ────────────────�
 5. `controller_server`（MPPI）结合 `local_costmap` 和路径，计算出速度指令 → `/cmd_vel_nav`；
 6. `velocity_smoother` 平滑限幅 → `/cmd_vel`；
 7. Gazebo `diff_drive` 执行速度，机器人移动；
-8. 轮子转动 → `/demo/odom` + `/joint_states`；IMU → `/demo/imu`；
+8. 轮子转动 → `/demo/odom` + `/joint_states`；IMU → `/livox/imu`；
 9. EKF 融合 → `odom→base_link` TF；AMCL 用 `/scan` 校正 → `map→odom` TF；
 10. 代价地图更新、机器人到达目标（误差 < `xy_goal_tolerance` + `yaw_goal_tolerance` 即判定成功）。
 
@@ -350,13 +350,13 @@ behavior_server(恢复行为) ────────────────�
 ```
 ros2 launch sam_bot_description navigation.launch.py
 │
-├─ IncludeLaunch(gzserver.launch.py)   ← 加载 src/world/my_world.sdf（Gazebo 世界）
+├─ IncludeLaunch(gzserver.launch.py)   ← 加载 src/sam_bot_description/world/my_world.sdf（Gazebo 世界）
 ├─ IncludeLaunch(gzclient.launch.py)   ← Gazebo 图形界面
 ├─ Node(robot_state_publisher)         ← 参数：xacro 展开后的 robot_description
 ├─ Node(spawn_entity.py)               ← 把机器人 spawn 进 Gazebo（-topic robot_description）
 ├─ Node(ekf_filter_node)               ← 参数：config/ekf.yaml + use_sim_time
 ├─ IncludeLaunch(nav2 bringup_launch.py) ← 参数：map + params_file + use_sim_time
-│    ├─ map_server      ← 加载 map/my_map.yaml
+│    ├─ map_server      ← 加载 src/sam_bot_description/map/my_map.yaml
 │    ├─ amcl / planner_server / controller_server / bt_navigator / ...
 │    └─ velocity_smoother
 └─ Node(rviz2)                          ← 加载 nav2_default_view.rviz
@@ -368,7 +368,7 @@ ros2 launch sam_bot_description navigation.launch.py
 |----------|-----------|------|
 | `navigation.launch.py` | `description/sam_bot_description.urdf` | 经 `Command(['xacro ', ...])` 展开成纯 URDF |
 | `navigation.launch.py` | `world/my_world.sdf` | Gazebo 世界 |
-| `navigation.launch.py` | `map/my_map.yaml` | 传给 map_server（经 Nav2 RewrittenYaml 改写 `yaml_filename`） |
+| `navigation.launch.py` | `src/sam_bot_description/map/my_map.yaml` | 传给 map_server（经 Nav2 RewrittenYaml 改写 `yaml_filename`） |
 | `navigation.launch.py` | `config/nav2_params.yaml` | Nav2 全套参数 |
 | `navigation.launch.py` | `config/ekf.yaml` | EKF 融合参数 |
 | `display.launch.py` | `rviz/urdf_config.rviz` | RViz 显示配置 |
@@ -376,7 +376,7 @@ ros2 launch sam_bot_description navigation.launch.py
 ### 8.3 CMakeLists.txt 安装规则
 
 ```
-install(DIRECTORY src/launch src/rviz src/description src/config src/world map
+install(DIRECTORY launch rviz description config world behavior_trees map
         DESTINATION share/${PROJECT_NAME})
 ```
 
@@ -395,8 +395,9 @@ install(DIRECTORY src/launch src/rviz src/description src/config src/world map
                     │                     │                                          │
                     │                     └──► /joint_states（轮子转角）              │
                     │                                                                │
-                    imu_sensor 插件 ──────────► /demo/imu（角速度+加速度）            │
-                    ray_sensor 插件 ──────────► /scan（激光雷达）                      │
+                    imu_sensor 插件 ──────────► /livox/imu（角速度+加速度）            │
+                    mid360 插件 ──────────► /livox/lidar（3D 点云）                    │
+                    pointcloud_to_laserscan ──► /scan（2D 激光投影）                    │
                     camera 插件 ──────────────► /depth_camera/*（深度图+点云）        │
                     └────────────────────────────────────────────────────────────────┘
 ```
@@ -406,7 +407,7 @@ install(DIRECTORY src/launch src/rviz src/description src/config src/world map
 ```
 /demo/odom ──┐
              ├──► ekf_filter_node ──► TF: odom→base_link ──┐
-/demo/imu ───┘                                              │
+/livox/imu ───┘                                              │
                                                             ├──► 完整 TF 树
 /joint_states ──► robot_state_publisher ──► TF: base_link→* ─┘
                  （+ /robot_description）
@@ -419,7 +420,7 @@ install(DIRECTORY src/launch src/rviz src/description src/config src/world map
 ### 9.3 导航数据流
 
 ```
-map/my_map.yaml ──► map_server ──► /map ──► global_costmap
+src/sam_bot_description/map/my_map.yaml ──► map_server ──► /map ──► global_costmap
                                             │
 /scan ──► global_costmap（障碍层）          │
 /scan ──► local_costmap（voxel 层）         │
@@ -441,8 +442,9 @@ local_costmap ──────────────────────
 | `/cmd_vel` | Twist | velocity_smoother、behavior_server | diff_drive |
 | `/cmd_vel_nav` | Twist | controller_server | velocity_smoother |
 | `/demo/odom` | Odometry | diff_drive | ekf_filter_node、velocity_smoother、bt_navigator |
-| `/demo/imu` | Imu | imu_sensor 插件 | ekf_filter_node |
-| `/scan` | LaserScan | ray_sensor 插件 | AMCL、global_costmap、local_costmap |
+| `/livox/imu` | Imu | imu_sensor 插件 | ekf_filter_node |
+| `/livox/lidar` | PointCloud2 | mid360 插件 | pointcloud_to_laserscan |
+| `/scan` | LaserScan | pointcloud_to_laserscan（由 `/livox/lidar` 投影） | AMCL、global_costmap、local_costmap |
 | `/joint_states` | JointState | joint_state_publisher 插件 | robot_state_publisher |
 | `/map` | OccupancyGrid | map_server | AMCL、global_costmap |
 | `/amcl_pose` | PoseWithCovarianceStamped | AMCL | RViz 等 |

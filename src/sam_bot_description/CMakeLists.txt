@@ -11,8 +11,11 @@ find_package(ament_cmake REQUIRED)
 # further dependencies manually.
 # find_package(<dependency> REQUIRED)
 
+# 【改动】规范化工作区后，本包位于 src/sam_bot_description/，install 源目录改为
+# 相对包根目录的路径（不再是 src/xxx）。安装后仍位于 share/sam_bot_description/，
+# 所以 launch 文件里 os.path.join(pkg_share, 'map', 'my_map.yaml') 无需改动。
 install(
-  DIRECTORY src/launch src/rviz src/description src/config src/world src/behavior_trees map
+  DIRECTORY launch rviz description config world behavior_trees map
   DESTINATION share/${PROJECT_NAME}
 )
 

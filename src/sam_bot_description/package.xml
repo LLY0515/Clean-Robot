@@ -20,6 +20,11 @@
   <exec_depend>nav2_rviz_plugins</exec_depend>
   <exec_depend>slam_toolbox</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
+  <!-- 【改动】新增两个运行依赖：
+       - mid360_simulation：URDF 里 xacro:include 它，Gazebo 加载 libmid360_plugin.so；
+       - pointcloud_to_laserscan：launch 里把点云转成 /scan 供 Nav2 使用。 -->
+  <exec_depend>mid360_simulation</exec_depend>
+  <exec_depend>pointcloud_to_laserscan</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

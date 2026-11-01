@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -e
 
-cd /home/rostwo/nav2xuexi/sam_bot_description
+# 【改动】用脚本自身所在目录作为工作区，避免硬编码旧路径 /home/rostwo/nav2xuexi/...
+cd "$(dirname "$0")"
 
 # 清理之前残留的进程
 echo "清理残留进程..."

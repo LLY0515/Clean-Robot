@@ -1,6 +1,7 @@
 import launch
 from launch.substitutions import Command, LaunchConfiguration
 import launch_ros
+from launch_ros.parameter_descriptions import ParameterValue
 import os
 
 def generate_launch_description():
@@ -12,7 +13,8 @@ def generate_launch_description():
     robot_state_publisher_node = launch_ros.actions.Node(
         package='robot_state_publisher',
         executable='robot_state_publisher',
-        parameters=[{'robot_description': Command(['xacro ', LaunchConfiguration('model')])}]
+        # 【改动】ParameterValue(value_type=str) 防止 xacro 展开结果被当 YAML 解析（同 navigation.launch.py）
+        parameters=[{'robot_description': ParameterValue(Command(['xacro ', LaunchConfiguration('model')]), value_type=str)}]
     )
     joint_state_publisher_node = launch_ros.actions.Node(
         package='joint_state_publisher',
@@ -48,6 +50,35 @@ def generate_launch_description():
        parameters=[os.path.join(pkg_share, 'config/ekf.yaml'), {'use_sim_time': LaunchConfiguration('use_sim_time')}]
     )
 
+    # 【改动】把 Mid-360 的 3D 点云 (/livox/lidar) 投影成 2D 激光扫描 (/scan)。
+    # display.launch.py 用于建图流程，slam_toolbox 只订阅 /scan(LaserScan)，
+    # 所以这里也必须起一个 pointcloud_to_laserscan 节点来产出 /scan。
+    pointcloud_to_laserscan_node = launch_ros.actions.Node(
+        package='pointcloud_to_laserscan',
+        executable='pointcloud_to_laserscan_node',
+        name='pointcloud_to_laserscan',
+        remappings=[
+            ('cloud_in', '/livox/lidar'),
+            ('scan', '/scan'),
+        ],
+        parameters=[{
+            'target_frame': 'base_link',
+            'transform_tolerance': 0.01,
+            'min_height': -0.05,
+            'max_height': 1.0,
+            'angle_min': -3.141592653589793,
+            'angle_max': 3.141592653589793,
+            'angle_increment': 0.0174532925199433,
+            'scan_time': 0.1,
+            'range_min': 0.1,
+            'range_max': 15.0,
+            'use_inf': True,
+            'inf_epsilon': 1.0,
+            'use_sim_time': LaunchConfiguration('use_sim_time'),
+        }],
+        output='screen'
+    )
+
     return launch.LaunchDescription([
         launch.actions.DeclareLaunchArgument(name='gui', default_value='True',
                                             description='Flag to enable joint_state_publisher_gui'),
@@ -63,5 +94,6 @@ def generate_launch_description():
         robot_state_publisher_node,
         spawn_entity,
         robot_localization_node,
+        pointcloud_to_laserscan_node,
         rviz_node
     ])

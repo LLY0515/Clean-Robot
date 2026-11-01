@@ -1,6 +1,6 @@
 # display.launch.py 与 urdf_config.rviz 教程
 
-> 本文拆解 [display.launch.py](../src/launch/display.launch.py) 和 [urdf_config.rviz](../src/rviz/urdf_config.rviz) 两个文件，讲清它们各自的作用、每一段的含义，以及两者如何配合把机器人模型在 RViz 里显示出来。
+> 本文拆解 [display.launch.py](../src/sam_bot_description/launch/display.launch.py) 和 [urdf_config.rviz](../src/sam_bot_description/rviz/urdf_config.rviz) 两个文件，讲清它们各自的作用、每一段的含义，以及两者如何配合把机器人模型在 RViz 里显示出来。
 >
 > 前置知识：URDF / Xacro 建模见 [URDF_XACRO_TUTORIAL.md](URDF_XACRO_TUTORIAL.md)。
 
@@ -46,7 +46,7 @@ display.launch.py（启动配方）
 
 ## 2. 第一部分：display.launch.py 逐段解析
 
-完整文件见 [display.launch.py](../src/launch/display.launch.py)，下面按块拆解。
+完整文件见 [display.launch.py](../src/sam_bot_description/launch/display.launch.py)，下面按块拆解。
 
 ### 2.1 导入依赖（第 1-4 行）
 
@@ -73,7 +73,7 @@ pkg_share = launch_ros.substitutions.FindPackageShare(package='sam_bot_descripti
 
   ```cmake
   install(
-    DIRECTORY src/launch src/rviz src/description
+    DIRECTORY launch rviz description
     DESTINATION share/${PROJECT_NAME}
   )
   ```
@@ -196,7 +196,7 @@ return launch.LaunchDescription([
 
 ## 3. 第二部分：urdf_config.rviz 逐段解析
 
-完整文件见 [urdf_config.rviz](../src/rviz/urdf_config.rviz)。这是 RViz 保存下来的配置文件，格式类似 YAML。它描述的是**界面和显示内容的“快照”**。
+完整文件见 [urdf_config.rviz](../src/sam_bot_description/rviz/urdf_config.rviz)。这是 RViz 保存下来的配置文件，格式类似 YAML。它描述的是**界面和显示内容的“快照”**。
 
 ### 3.1 顶层结构
 
@@ -316,9 +316,9 @@ Global Options:
 
 ```bash
 # 进入包目录（包含 CMakeLists.txt / package.xml 的那一层）
-cd /home/rostwo/nav2xuexi/sam_bot_description
+cd /home/rostwo/CleanRobot_ws
 
-# 构建（这会执行 CMakeLists.txt 里的 install 规则，把 src/launch/rviz 装到 share/ 下）
+# 构建（这会执行 CMakeLists.txt 里的 install 规则，把 src/sam_bot_description/launch/rviz 装到 share/ 下）
 colcon build
 
 # 让当前终端找到安装后的包
@@ -340,7 +340,7 @@ ros2 launch sam_bot_description display.launch.py model:=/path/to/my_robot.urdf.
 
 启动后应该看到：
 
-- RViz 窗口打开，加载了 [urdf_config.rviz](../src/rviz/urdf_config.rviz) 的配置；
+- RViz 窗口打开，加载了 [urdf_config.rviz](../src/sam_bot_description/rviz/urdf_config.rviz) 的配置；
 - 青色底盘 + 两个灰色轮子 + 前方球体；
 - 左侧 Displays 面板有 Grid / RobotModel / TF 三项；
 - 用滑杆（gui=True 时）拖动 `drivewhl_l_joint` / `drivewhl_r_joint`，轮子会跟着转。
@@ -349,7 +349,7 @@ ros2 launch sam_bot_description display.launch.py model:=/path/to/my_robot.urdf.
 
 ```bash
 # 1. 确认 xacro 能展开（或直接 xacro 你的文件）
-xacro src/description/sam_bot_description.urdf
+xacro src/sam_bot_description/description/sam_bot_description.urdf
 
 # 2. 确认 robot_description 参数已加载
 ros2 param get /robot_state_publisher robot_description
@@ -373,7 +373,7 @@ ros2 topic echo /joint_states
 | `xacro: command not found` | 没装 xacro，或没 source 环境 | `sudo apt install ros-<distro>-xacro` |
 | launch 报找不到包 | 没 `colcon build` 或没 `source install/setup.bash` | 重新 build + source |
 | 改了 URDF 但 RViz 不变 | 改的是源码目录，但 launch 读的是安装后的 `share/` 副本 | 重新 `colcon build` |
-| build 报 `file INSTALL cannot find ...` | install 的 `DIRECTORY` 写了不存在的目录（如把 `src/launch` 写成了根目录的 `launch`） | 让 `DIRECTORY` 指向真实路径 |
+| build 报 `file INSTALL cannot find ...` | install 的 `DIRECTORY` 指向了不存在的目录（包根下现在用 `launch`，误写成 `src/launch` 会找不到） | 让 `DIRECTORY` 指向包根下的真实相对路径 |
 | 改了 install 规则但旧文件还在 | CMake 安装不会清理 `install/` 里的旧文件，会残留过期副本 | `rm -rf build install log` 后重新 `colcon build` |
 | 轮子不转 | continuous 关节，滑杆版能转；但 joint 的 axis 设错方向 | 检查 `<axis>` 是否绕期望的轴 |
 

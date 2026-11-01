@@ -34,7 +34,10 @@ ekf_filter_node:
                        false, false, false]
 
 # IMU：只融合 yaw 姿态（roll / pitch 在平面机器人上忽略）
-        imu0: demo/imu
+# 【改动】改用 Mid-360 内置 IMU（话题 /livox/imu，frame: livox_imu）。
+# 原独立的 imu_link（/demo/imu）已从 URDF 删除。livox_imu 经 base_link→livox→livox_imu
+# 两段固定关节(rpy=0)与 base_link 轴对齐，旋转恒等，因此 imu0_config 无需改动。
+        imu0: livox/imu
         imu0_config: [false, false, false,
                       false, false, true,
                       false, false, false,

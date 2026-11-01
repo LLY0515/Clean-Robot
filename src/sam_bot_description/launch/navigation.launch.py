@@ -5,6 +5,7 @@ from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, Command
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 def generate_launch_description():
     # ================= 1. 获取各个包的路径 =================
@@ -55,7 +56,10 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'use_sim_time': use_sim_time,
-            'robot_description': Command(['xacro ', urdf_file])
+            # 【改动】必须用 ParameterValue(value_type=str) 显式声明为字符串，
+            # 否则 xacro 展开的 URDF 里若含半角冒号+空格（如 mid360.xacro 的中文注释
+            # “最大测距: 15m”），launch 会当 YAML 解析而报 “mapping values are not allowed here”。
+            'robot_description': ParameterValue(Command(['xacro ', urdf_file]), value_type=str)
         }]
     )
 
@@ -76,6 +80,37 @@ def generate_launch_description():
         name='ekf_filter_node',
         output='screen',
         parameters=[os.path.join(pkg_share, 'config', 'ekf.yaml'), {'use_sim_time': use_sim_time}]
+    )
+
+    # (4.6) 【改动】把 Mid-360 的 3D 点云 (/livox/lidar) 投影成 2D 激光扫描 (/scan)，
+    #       供 Nav2 的 AMCL 与代价地图障碍层使用（它们只认 LaserScan）。
+    pointcloud_to_laserscan = Node(
+        package='pointcloud_to_laserscan',
+        executable='pointcloud_to_laserscan_node',
+        name='pointcloud_to_laserscan',
+        remappings=[
+            ('cloud_in', '/livox/lidar'),
+            ('scan', '/scan'),
+        ],
+        parameters=[{
+            'target_frame': 'base_link',      # 先把点云变换到 base_link，再投影成 2D
+            'transform_tolerance': 0.01,
+            # 只保留 base_link 高度范围内的点投影成 2D。base_link 离地约 0.15 m，
+            # 地面在 base_link 系下约 -0.15 m。min_height 必须高于地面，否则最下沿
+            # -7.22° 波束打出的地面环(~2.1 m)会遮蔽 4.9 m 处的墙，导致 AMCL 无墙面信息而漂移。
+            'min_height': -0.05,
+            'max_height': 1.0,
+            'angle_min': -3.141592653589793,
+            'angle_max': 3.141592653589793,
+            'angle_increment': 0.0174532925199433,  # 1° → 360 个点
+            'scan_time': 0.1,
+            'range_min': 0.1,
+            'range_max': 15.0,                # 与 mid360.xacro 里 laser_max_range 一致
+            'use_inf': True,
+            'inf_epsilon': 1.0,
+            'use_sim_time': use_sim_time,
+        }],
+        output='screen'
     )
 
     # (5) 启动完整的 Nav2 导航栈
@@ -115,6 +150,7 @@ def generate_launch_description():
         robot_state_publisher,
         spawn_entity,
         ekf_node,
+        pointcloud_to_laserscan,
         nav2_bringup,
         rviz2
     ])
