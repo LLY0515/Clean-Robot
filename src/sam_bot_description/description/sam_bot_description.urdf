@@ -186,7 +186,7 @@
     <origin xyz="-0.20921999999999999 0.26816000000000001 -0.1575" rpy="0 0 0" />
     <axis xyz="0 0 1" />
     <limit effort="5" velocity="10" />
-    <dynamics damping="0.2" friction="0.0"/>
+    <dynamics damping="0.2" friction="0.1"/>
   </joint>
 
   <link name="new_link_3">
@@ -215,10 +215,10 @@
   <joint name="new_link_3_joint" type="continuous">
     <parent link="new_link_2" />
     <child link="new_link_3" />
-    <origin xyz="-0.017381000000000001 0.030003999999999999 -0.040500000000000001" rpy="0 0 0" />
+    <origin xyz="-0.017381000000000001 0.030003999999999999 -0.0405" rpy="0 0 0" />
     <axis xyz="-1 0 0" />
     <limit effort="1" velocity="20" />
-    <dynamics damping="0.02" friction="0.0"/>
+    <dynamics damping="0.2" friction="0.2"/>
   </joint>
 
   <link name="new_link_4">
@@ -250,7 +250,7 @@
     <origin xyz="0.21078 0.26816000000000001 -0.1595" rpy="0 0 0" />
     <axis xyz="0 0 1" />
     <limit effort="5" velocity="10" />
-    <dynamics damping="0.2" friction="0.0"/>
+    <dynamics damping="0.2" friction="0.1"/>
   </joint>
 
   <link name="new_link_5">
@@ -282,12 +282,17 @@
     <origin xyz="0.017519 0.030003999999999999 -0.0385" rpy="0 0 0" />
     <axis xyz="-1 0 0" />
     <limit effort="1" velocity="20" />
-    <dynamics damping="0.02" friction="0.0"/>
+    <dynamics damping="0.2" friction="0.2"/>
   </joint>
 
   <!-- ============================================================
        5. Gazebo 摩擦参数
-          驱动轮要有抓地力；万向轮摩擦小，避免转向时拖拽。
+          驱动轮要有抓地力（mu=1.0）。
+          万向轮：保持 2mm 悬空（new_link_3/5_joint 的 z 分别为 -0.0405/-0.0385，
+          轮底在 -0.238，离地 2mm）。实测「着地」会让机器人前进时被万向轮
+          前导偏移顶起来（z 抬升 ~7.7cm、几乎不前进），所以不落地，只靠
+          关节 damping/friction=0.2 止住空转（friction=0 会一直空转 ~-0.6rad/s）。
+          地面 mu=0.1 仅作为偶尔擦碰时的低摩擦。
        ============================================================ -->
   <gazebo reference="new_link">
     <mu1>1.0</mu1>
@@ -362,20 +367,28 @@
           实测 CAD 网格里雷达装在一个 30° 斜面上（斜面法向量 (0, ±0.5, ±0.866)，
           绕车体横向轴前倾），即雷达本体朝前进方向前倾 30°。base_link 前进方向
           是 +x，故 pitch 取 +30°（rpy 的 pitch 项 ${pi/6}）。
-          宏的可视网格相对 link 原点下沉 0.045 m，倾斜以网格底面为支点：
-          底面落在底座板 z=0.84、水平中心 x=0.3235 处不动，网格向上前倾 30°。
-          注意：这里只倾斜「可视网格」（visual_rpy），livox link 本身以及
-          雷达/IMU 坐标系仍保持水平。原因：FAST-LIO 的 IMU 姿态以初始水平
-          为基准、且默认 IMU 与 base_link 对齐；若把 link/IMU 一起倾斜 30°，
-          odom→base_link 会在运动时严重发散（实测 pitch 漂到 60°），导致
-          AMCL 失定位、Nav2 陷入 recovery 原地旋转。因此保留水平雷达/IMU
-          坐标系，仅让外观与 CAD 的 30° 斜装一致，导航管线照常工作。
-          向下波束会打到 z≈0.845 的底座板，pointcloud_to_laserscan 的
-          max_height=0.80 能滤掉这些自身回波，同时保留墙面点（墙顶对应
-          base_link z=0.76）。
+          整个 livox link（可视网格 + 射线传感器）按真实安装角度前倾 30°：
+          宏的可视网格相对 link 原点下沉 0.045 m，倾斜以网格底面为支点。
+          雷达原装位：底面落在底座板 z=0.84、水平中心 x=0.3235；link 原点
+          在 +30° 方向上抬 R·(0,0,0.045)≈(0.0225,0,0.039)。
+          但 30° 前倾后，向下的波束会扫到车头前脸/横杠（碰撞盒 collision_upper
+          前上缘 x≈0.475、z≈0.80），把自身识别成障碍物、遮住前方点云。为此把
+          雷达整体抬高 0.051 m（底面到 z≈0.891），倾斜角不变，让最低波束
+          （水平面下 37.2°）在 x=0.475 处约 z=0.832，已越过车头：
+          xyz = (0.3235+0.0225, 0, 0.84+0.039+0.051) = (0.346, 0, 0.93)。
+          这样雷达点云是真正按 30° 斜装发射的（不只是外观倾斜）。
+          为了不破坏 FAST-LIO：把 IMU 坐标系用 imu_rpy 反向旋转回水平
+          （rpy=(0,-pi/6,0)），即机体/IMU 仍与 base_link 对齐；雷达相对 IMU
+          的 30° 旋转通过 FAST-LIO 的 extrinsic_R/T 精确补偿
+          （extrinsic_R=Ry(30°)，extrinsic_T=[0.012534,-0.02329,0.043708]，
+          只描述雷达↔IMU 相对位姿，抬高后无需改动）。
+          若 IMU 也跟着倾斜且外参不修正，odom→base_link 会发散（实测 pitch
+          漂到 60°），AMCL 失定位。雷达后方/侧方的陡峭向下波束仍会扫到
+          z≈0.80 的车顶，pointcloud_to_laserscan 的 max_height=0.80 能滤掉
+          这些自身回波，同时保留墙面点（墙顶对应 base_link z=0.76）。
        ============================================================ -->
-  <xacro:mid360 name="livox" parent="base_link" visual_rpy="0 ${pi/6} 0">
-    <origin xyz="0.3235 0 0.885"/>
+  <xacro:mid360 name="livox" parent="base_link" imu_rpy="0 ${-pi/6} 0">
+    <origin xyz="0.346 0 0.93" rpy="0 ${pi/6} 0"/>
   </xacro:mid360>
 
   <!-- ============================================================

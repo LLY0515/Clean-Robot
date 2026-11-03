@@ -23,3 +23,7 @@ src/fast_lio/PCD/
 
 # Windows/WSL 复制文件产生的元数据（形如 foo:Zone.Identifier）
 *Zone.Identifier*
+
+# tf2/RViz 导出的 TF 框架图（运行时生成，非源码）
+frames_*.gv
+frames_*.pdf

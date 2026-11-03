@@ -35,10 +35,13 @@
             fov_degree:    360.0
             det_range:     100.0
             extrinsic_est_en:  false      # true: enable the online estimation of IMU-LiDAR extrinsic
-            extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
-            extrinsic_R: [ 1., 0., 0.,
+            # 雷达 link 物理前倾 30°（绕 base_link +y），IMU 坐标系反向旋回水平。
+            # 因此 lidar->IMU 的旋转为 Ry(+30°)，平移为 -Ry(30°)·t_imu
+            # （t_imu=(0.011,0.02329,-0.04412) 为 IMU 在雷达系下的安装位置）。
+            extrinsic_T: [ 0.0125337, -0.02329, 0.0437090 ]
+            extrinsic_R: [ 0.8660254, 0., 0.5,
                             0., 1., 0.,
-                            0., 0., 1.]
+                           -0.5, 0., 0.8660254 ]
 
         publish:
             path_en: true                # true: publish Path

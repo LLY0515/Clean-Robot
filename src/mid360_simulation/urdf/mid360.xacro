@@ -81,17 +81,15 @@
          - ${name}:     激光雷达主体坐标系 (点云参考系)
          - ${name}_imu: 内置 IMU 坐标系
        ============================================================ -->
-  <xacro:macro name="mid360" params="name parent visual_rpy:='0 0 0' *origin">
+  <xacro:macro name="mid360" params="name parent imu_rpy:='0 0 0' *origin">
 
     <!-- ==================== 激光雷达主体 Link ==================== -->
     <link name="${name}">
       <xacro:mid360_inertia m="${mass}"/>
 
       <!-- 可视化模型 -->
-      <!-- visual_rpy 只用于把可视网格按真实安装角度倾斜；link 自身与雷达/IMU
-           坐标仍保持水平，避免破坏 FAST-LIO 的 IMU 姿态解算。默认不倾斜。 -->
       <visual>
-        <origin xyz="0 0 -0.045" rpy="${visual_rpy}"/>
+        <origin xyz="0 0 -0.045" rpy="0 0 0"/>
         <geometry>
           <mesh filename="$(find mid360_simulation)/meshes/livox_frame.STL"/>
         </geometry>
@@ -120,9 +118,12 @@
     <!-- Mid-360 内置 6 轴 IMU (BMI088) -->
     <link name="${name}_imu"/>
 
-    <!-- IMU 与激光雷达的固定关节 (基于官方外参标定) -->
+    <!-- IMU 与激光雷达的固定关节 (基于官方外参标定)
+         imu_rpy 默认 0 0 0；当雷达 link 本身倾斜安装时，可用它把 IMU 坐标系
+         反向旋转回水平，使 FAST-LIO 仍以水平 base_link 为机体（重力/姿态解算
+         才不会发散）。雷达→IMU 的相对旋转则写进 FAST-LIO 的 extrinsic_R/T。 -->
     <joint name="${name}_imu_joint" type="fixed">
-      <origin xyz="0.011 0.02329 -0.04412" rpy="0 0 0"/>
+      <origin xyz="0.011 0.02329 -0.04412" rpy="${imu_rpy}"/>
       <parent link="${name}"/>
       <child link="${name}_imu"/>
     </joint>
@@ -213,9 +214,12 @@
           <samples>${point_rate / update_rate}</samples>
           <!-- 降采样因子: 减少实际射线数量以提高性能 -->
           <!-- 实际射线数 = samples / downsample, 值越大性能越好但精度越低 -->
-          <!-- samples=200000/10=20000（全向覆盖），downsample=20 → 20000/20=1000 条射线/帧，
-               既覆盖 360° 又避免 CPU 射线投射过慢。 -->
-          <downsample>20</downsample>
+          <!-- 【改动】downsample 10→8：20000/8=2500 条射线/帧。
+               downsample=5（4000 条）会让 gzserver 段错误 exit -11，且可复现；
+               两次崩溃都在 libgazebo_ode.so 内，都是把非法指针（0 / 0x158）当成
+               旋转矩阵做乘法——即 Gazebo ODE 包装层对 ray 位姿的空/野指针解引用。
+               2500 条（downsample=8）连续跑 35min+ 稳定，是当前安全上限。 -->
+          <downsample>8</downsample>
           <csv_file_name>$(find mid360_simulation)/scan_mode/mid360.csv</csv_file_name>
           <topic>${lidar_topic}</topic>
 

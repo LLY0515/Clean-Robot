@@ -32,10 +32,15 @@ amcl:
     tf_broadcast: true
     transform_tolerance: 1.0
     update_min_a: 0.2
-    update_min_d: 0.25
-    z_hit: 0.5
+    # 【改动】0.25→0.15：AMCL 在机器人每移动 0.15m 就更频繁地做测量校正，
+    # 减少运动过程中 map->odom 校正的滞后（此前运动时定位误差 0.3~0.75m）。
+    update_min_d: 0.15
+    # 【改动】z_hit/z_rand 从 0.5/0.5 改回 0.95/0.05：原值让 AMCL 认为
+    # 一半激光束是纯随机噪声，测量权重几乎拉平，粒子滤波在稀疏 /scan 下
+    # 收敛不住、map->odom 会大范围跳变（实测 9~14m），是可见「飘」的主因。
+    z_hit: 0.95
     z_max: 0.05
-    z_rand: 0.5
+    z_rand: 0.05
     z_short: 0.05
     scan_topic: scan
 

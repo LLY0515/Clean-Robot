@@ -73,10 +73,15 @@ def generate_launch_description():
         # 【改动】-timeout 从默认 30s 放宽到 120s：本机 gzserver 首次加载世界
         # 可能超过 30s，spawn_entity 等不到 /spawn_entity 服务会直接报错退出，
         # 导致机器人没生成、/livox/* 无数据、FAST-LIO 没有 odom。
-        # 【改动】-z 0.25：新 CAD 模型原点在车体中心，驱动轮最低点在 base_link 系
-        # z=-0.24。若按默认 z=0 生成，整个车身会陷进地面，物理引擎会把机器人弹飞。
+        # 【改动】-z 0.24：新 CAD 模型原点在车体中心，驱动轮最低点在 base_link 系
+        # z=-0.24，故 base_link 在 z=0.24 时车轮正好落地。若按默认 z=0 生成，
+        # 整个车身会陷进地面被弹飞；而 -z 0.25（旧值）会让机器人先下落 1cm 再
+        # 弹跳，此时 FAST-LIO 的 IMU_init 正在采集静止数据，把下落/弹跳的加速度
+        # 平均进重力估计，使重力向量偏 ~7°，导致里程计位置一路漂移到十几米外
+        # （odom->base_link z 掉到 -3m）。改到 z=0.24 让机器人一出生就落地，
+        # FAST-LIO 初始化的重力向量才干净、里程计不发散。
         arguments=['-topic', 'robot_description', '-entity', 'sam_bot',
-                   '-timeout', '120', '-z', '0.25'],
+                   '-timeout', '120', '-z', '0.24'],
         output='screen'
     )
 
