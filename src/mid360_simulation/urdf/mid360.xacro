@@ -81,15 +81,17 @@
          - ${name}:     激光雷达主体坐标系 (点云参考系)
          - ${name}_imu: 内置 IMU 坐标系
        ============================================================ -->
-  <xacro:macro name="mid360" params="name parent *origin">
+  <xacro:macro name="mid360" params="name parent visual_rpy:='0 0 0' *origin">
 
     <!-- ==================== 激光雷达主体 Link ==================== -->
     <link name="${name}">
       <xacro:mid360_inertia m="${mass}"/>
 
       <!-- 可视化模型 -->
+      <!-- visual_rpy 只用于把可视网格按真实安装角度倾斜；link 自身与雷达/IMU
+           坐标仍保持水平，避免破坏 FAST-LIO 的 IMU 姿态解算。默认不倾斜。 -->
       <visual>
-        <origin xyz="0 0 -0.045" rpy="0 0 0"/>
+        <origin xyz="0 0 -0.045" rpy="${visual_rpy}"/>
         <geometry>
           <mesh filename="$(find mid360_simulation)/meshes/livox_frame.STL"/>
         </geometry>

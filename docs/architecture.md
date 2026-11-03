@@ -105,14 +105,14 @@ ROS / Nav2 / 差速插件要求 `base_link` 的 **X 轴朝前、Y 轴朝左**，
 | `new_link_1_joint` | **continuous** | base_chassis → new_link_1 | 右驱动轮，转轴 (−1,0,0) |
 | `new_link_2_joint` / `new_link_4_joint` | **continuous** | base_chassis → 支架 | 万向轮转向（绕 Z，被动） |
 | `new_link_3_joint` / `new_link_5_joint` | **continuous** | 支架 → 小轮 | 万向轮滚动（被动） |
-| `livox_joint` | fixed | base_link → livox | (0.30, 0, 0.95)：车头最高平台上方 |
+| `livox_joint` | fixed | base_link → livox | (0.3235, 0, 0.885)，水平；仅可视网格按 CAD 斜面朝前进方向前倾 30°（`visual_rpy`） |
 | `livox_imu_joint` | fixed | livox → livox_imu | CAD 给定的 LiDAR-IMU 外参 |
 | `camera_joint` | fixed | base_link → camera_link | (0.50, 0, 0.30)，车头前脸 |
 | `camera_depth_joint` | fixed | camera_link → camera_depth_frame | 相机光轴旋转 |
 
 > 6 个车轮/万向轮关节都是 `continuous`，其余为 `fixed`。Gazebo 物理仿真更新转角后，通过 `joint_state_publisher` 插件发布，供 `robot_state_publisher` 计算轮子 TF。
 >
-> **雷达安装高度**：雷达（z=0.95）是整车最高点，向下的波束会扫到自身安装平台。`pointcloud_to_laserscan` 的 `max_height` 设为 0.80（墙面最高点对应 `base_link` z=0.76），既滤掉自身回波又保留全部墙面点。
+> **雷达安装**：CAD 网格原本画了一个 Mid-360（z=0.84~0.915），已从 `base_link.STL` 中删除，只保留 z=0.80~0.84 的安装底座板。实测 CAD 里的雷达装在一个 30° 斜面上、朝前进方向前倾 30°，故仿真雷达同样按 30° 前倾：`mid360.xacro` 宏新增 `visual_rpy` 参数，仅把**可视网格**绕网格底面支点前倾（`rpy=(0, π/6, 0)`），使外观与 CAD 一致。`livox` link 本身与雷达/IMU 坐标系仍保持水平（`livox_joint` 为 (0.3235, 0, 0.885)、无旋转）。注意**不能**把 link/IMU 一起倾斜：FAST-LIO 以初始水平为基准且默认 IMU 与 `base_link` 对齐，整条 link 倾斜 30° 会在运动时使 `odom→base_link` 姿态严重发散（实测 pitch 漂到 60°），导致 AMCL 失定位、Nav2 进入 recovery 原地旋转；保持水平坐标系后导航正常。向下的波束会扫到底座板（z≈0.845），`pointcloud_to_laserscan` 的 `max_height` 设为 0.80（墙面最高点对应 `base_link` z=0.76），既滤掉自身回波又保留全部墙面点。
 
 ---
 
