@@ -65,47 +65,54 @@ sam_bot_description/
 
 文件：`src/sam_bot_description/description/sam_bot_description.urdf`（xacro 格式，根元素带 `xmlns:xacro`）。
 
-### 2.1 xacro 常量与宏
+### 2.1 模型来源与坐标系约定
 
-模型顶部用 `<xacro:property>` 定义了尺寸常量，避免重复写死：
+模型来自 OSURDF 导出的 CAD 网格（`meshes/visual/*.STL`），原生坐标是 **X 横向、Y 前进、Z 朝上**，质量/惯量由 CAD 直接给出（整车约 33 kg）。
 
-| 常量 | 值 | 含义 |
-|------|-----|------|
-| `base_length` / `base_width` / `base_height` | 0.42 / 0.31 / 0.18 | 车体（长方体）长宽高 |
-| `wheel_radius` / `wheel_width` | 0.10 / 0.04 | 驱动轮半径 / 宽度 |
-| `wheel_xoff` / `wheel_zoff` / `wheel_ygap` | 0.12 / 0.05 / 0.025 | 轮子 x/z 偏移、横向间隙 |
+ROS / Nav2 / 差速插件要求 `base_link` 的 **X 轴朝前、Y 轴朝左**，所以模型里做了两层坐标：
 
-三个**惯性宏**自动计算转动惯量（`box_inertia`、`cylinder_inertia`、`sphere_inertia`），供 Gazebo 物理引擎使用。
+- `base_link`：标准 ROS 根坐标系（空 link，X 朝前）。
+- `base_chassis`：CAD 原生坐标系，用固定关节 `chassis_joint`（`rpy="0 0 -π/2"`）挂在 `base_link` 下。所有 CAD 网格、车轮、关节都随它一起旋转 90°，外部看到的仍是标准 ROS 朝向。
+
+整车包络约 **1.05 m(长) × 0.74 m(宽) × 1.08 m(高)**，驱动轮最低点在 `base_link` 系 z=−0.24，因此 `base_footprint` 放在 z=−0.24。
+
+> **碰撞体**：`base_link.STL` 有 78 万个三角面，直接做碰撞会让 ODE 极慢，所以 visual 用 STL、collision 用简单几何体（两个长方体 + 车轮圆柱）。
 
 ### 2.2 link 与 joint 结构
 
 机器人由以下 **link** 组成（`base_link` 为树根）：
 
-| link | 形状 / 质量 | 说明 |
-|------|------------|------|
-| `base_link` | 0.42×0.31×0.18 箱体，15 kg | 车体本体（URDF 树根） |
-| `base_footprint` | 空 link | 地面投影点（2D 导航基准） |
-| `drivewhl_l_link` / `drivewhl_r_link` | 圆柱 r=0.10，0.5 kg | 左右驱动轮 |
-| `front_caster` | 球 r≈0.06，0.5 kg | 前万向轮（摩擦设 0） |
-| `livox_imu` | 空 link（无质量/惯量） | Mid-360 内置 IMU 坐标系 |
-| `livox` | STL 网格，0.265 kg | Mid-360 激光雷达 |
-| `camera_link` | 0.015×0.130×0.022 箱体 | 深度相机安装点 |
-| `camera_depth_frame` | 空 link | 相机光学坐标系 |
+| link | 质量 | 说明 |
+|------|------|------|
+| `base_link` | — | 空 link，ROS 标准根坐标系（X 朝前） |
+| `base_footprint` | — | 空 link，地面投影点（z=−0.24，2D 导航基准） |
+| `base_chassis` | 28.11 kg | CAD 车体本体（旋转 −90° 后的坐标系） |
+| `new_link` / `new_link_1` | 2.147 kg | 左右驱动轮（后轴） |
+| `new_link_2` / `new_link_4` | 0.0626 kg | 前部万向轮转向支架 |
+| `new_link_3` / `new_link_5` | 0.162 kg | 前部万向轮小轮 |
+| `livox` | — | Mid-360 激光雷达（STL 网格） |
+| `livox_imu` | — | Mid-360 内置 IMU 坐标系 |
+| `camera_link` | 0.035 kg | 深度相机安装点 |
+| `camera_depth_frame` | — | 相机光学坐标系 |
 
 **joint 连接关系**（所有 joint 由 `robot_state_publisher` 解析为 TF）：
 
 | joint | 类型 | parent → child | 说明 |
 |-------|------|----------------|------|
-| `base_joint` | fixed | base_link → base_footprint | z 偏移 −0.15，把 footprint 放到地面 |
-| `drivewhl_l_joint` | **continuous** | base_link → drivewhl_l_link | 左轮，转轴 (0,1,0) |
-| `drivewhl_r_joint` | **continuous** | base_link → drivewhl_r_link | 右轮，转轴 (0,1,0) |
-| `caster_joint` | fixed | base_link → front_caster | 前万向轮 |
-| `livox_imu_joint` | fixed | livox → livox_imu | (0.011, 0.02329, −0.04412) |
-| `livox_joint` | fixed | base_link → livox | z +0.12 |
-| `camera_joint` | fixed | base_link → camera_link | (0.215, 0, 0.05) |
+| `base_footprint_joint` | fixed | base_link → base_footprint | z 偏移 −0.24 |
+| `chassis_joint` | fixed | base_link → base_chassis | 绕 Z 转 −90°，把 CAD 的 +Y 对到 ROS 的 +X |
+| `new_joint` | **continuous** | base_chassis → new_link | 左驱动轮，转轴 (−1,0,0)（取反后正速度=前进） |
+| `new_link_1_joint` | **continuous** | base_chassis → new_link_1 | 右驱动轮，转轴 (−1,0,0) |
+| `new_link_2_joint` / `new_link_4_joint` | **continuous** | base_chassis → 支架 | 万向轮转向（绕 Z，被动） |
+| `new_link_3_joint` / `new_link_5_joint` | **continuous** | 支架 → 小轮 | 万向轮滚动（被动） |
+| `livox_joint` | fixed | base_link → livox | (0.30, 0, 0.95)：车头最高平台上方 |
+| `livox_imu_joint` | fixed | livox → livox_imu | CAD 给定的 LiDAR-IMU 外参 |
+| `camera_joint` | fixed | base_link → camera_link | (0.50, 0, 0.30)，车头前脸 |
 | `camera_depth_joint` | fixed | camera_link → camera_depth_frame | 相机光轴旋转 |
 
-> 只有左右驱动轮是 `continuous`（可无限旋转），其余都是 `fixed`。`continuous` 关节的转角由 Gazebo 物理仿真更新，再通过 `joint_state_publisher` 插件发布，供 `robot_state_publisher` 计算轮子 TF。
+> 6 个车轮/万向轮关节都是 `continuous`，其余为 `fixed`。Gazebo 物理仿真更新转角后，通过 `joint_state_publisher` 插件发布，供 `robot_state_publisher` 计算轮子 TF。
+>
+> **雷达安装高度**：雷达（z=0.95）是整车最高点，向下的波束会扫到自身安装平台。`pointcloud_to_laserscan` 的 `max_height` 设为 0.80（墙面最高点对应 `base_link` z=0.76），既滤掉自身回波又保留全部墙面点。
 
 ---
 
@@ -129,9 +136,9 @@ URDF 里的 `<gazebo>` 标签在机器人被 spawn 进 Gazebo 时生效，每个
     <namespace>/demo</namespace>
     <remapping>cmd_vel:=/cmd_vel</remapping>
   </ros>
-  <left_joint>drivewhl_l_joint</left_joint>
-  <right_joint>drivewhl_r_joint</right_joint>
-  <wheel_separation>0.36</wheel_separation>
+  <left_joint>new_joint</left_joint>
+  <right_joint>new_link_1_joint</right_joint>
+  <wheel_separation>0.481</wheel_separation>
   <wheel_diameter>0.2</wheel_diameter>
   <publish_odom>true</publish_odom>
   <publish_odom_tf>false</publish_odom_tf>   <!-- 重要：不发布 odom->base_link TF -->

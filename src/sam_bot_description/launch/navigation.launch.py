@@ -73,8 +73,10 @@ def generate_launch_description():
         # 【改动】-timeout 从默认 30s 放宽到 120s：本机 gzserver 首次加载世界
         # 可能超过 30s，spawn_entity 等不到 /spawn_entity 服务会直接报错退出，
         # 导致机器人没生成、/livox/* 无数据、FAST-LIO 没有 odom。
+        # 【改动】-z 0.25：新 CAD 模型原点在车体中心，驱动轮最低点在 base_link 系
+        # z=-0.24。若按默认 z=0 生成，整个车身会陷进地面，物理引擎会把机器人弹飞。
         arguments=['-topic', 'robot_description', '-entity', 'sam_bot',
-                   '-timeout', '120'],
+                   '-timeout', '120', '-z', '0.25'],
         output='screen'
     )
 
@@ -108,7 +110,11 @@ def generate_launch_description():
             # 地面在 base_link 系下约 -0.15 m。min_height 必须高于地面，否则最下沿
             # -7.22° 波束打出的地面环(~2.1 m)会遮蔽 4.9 m 处的墙，导致 AMCL 无墙面信息而漂移。
             'min_height': -0.05,
-            'max_height': 1.0,
+            # 【改动】新模型最高点在 base_link z≈0.91（雷达装在 0.95），
+            # 若 max_height 仍是 1.0，雷达会把自己的安装平台/车身顶部投影进
+            # /scan（实测出现 0.23 m 的假障碍）。墙顶 1.0 m 对应 base_link
+            # z=0.76，所以上限取 0.80：既能滤掉自身回波，又保留全部墙面点。
+            'max_height': 0.80,
             'angle_min': -3.141592653589793,
             'angle_max': 3.141592653589793,
             'angle_increment': 0.0174532925199433,  # 1° → 360 个点

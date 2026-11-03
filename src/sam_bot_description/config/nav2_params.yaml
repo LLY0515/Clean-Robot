@@ -210,7 +210,10 @@ local_costmap:
       width: 3
       height: 3
       resolution: 0.05
-      footprint: "[ [0.21, 0.195], [0.21, -0.195], [-0.21, -0.195], [-0.21, 0.195] ]"
+      # 【改动】新 CAD 模型外形约 1.05 m(长) x 0.74 m(宽，含驱动轮)，base_link 在车体中心。
+      # 旧值 0.42 x 0.39 是按小机器人设置的，若继续沿用会让规划器认为可以贴墙太近，
+      # 实际车身会撞到障碍；这里按网格包络外扩 1~2 cm。
+      footprint: "[ [0.55, 0.38], [0.55, -0.38], [-0.54, -0.38], [-0.54, 0.38] ]"
       plugins: ["voxel_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
@@ -255,7 +258,9 @@ global_costmap:
       publish_frequency: 1.0
       global_frame: map
       robot_base_frame: base_link
-      robot_radius: 0.3
+      # 【改动】与 local_costmap 保持同一矩形轮廓（机器人不是圆形，用 robot_radius 会
+      # 在窄通道里过度保守或碰撞，取决于外接圆/内切圆取法）。
+      footprint: "[ [0.55, 0.38], [0.55, -0.38], [-0.54, -0.38], [-0.54, 0.38] ]"
       resolution: 0.05
       track_unknown_space: true
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]

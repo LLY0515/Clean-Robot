@@ -15,7 +15,7 @@ find_package(ament_cmake REQUIRED)
 # 相对包根目录的路径（不再是 src/xxx）。安装后仍位于 share/sam_bot_description/，
 # 所以 launch 文件里 os.path.join(pkg_share, 'map', 'my_map.yaml') 无需改动。
 install(
-  DIRECTORY launch rviz description config world behavior_trees map
+  DIRECTORY launch rviz description config world behavior_trees map meshes
   DESTINATION share/${PROJECT_NAME}
 )
 

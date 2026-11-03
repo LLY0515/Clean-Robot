@@ -41,8 +41,9 @@ def generate_launch_description():
         package='gazebo_ros',
         executable='spawn_entity.py',
         # 【改动】-timeout 放宽到 120s，避免 gzserver 启动慢时 spawn 服务还没就绪就退出。
+        # 【改动】-z 0.25：新 CAD 模型轮底在 base_link 系 z=-0.24，抬高后再落下。
         arguments=['-entity', 'sam_bot', '-topic', 'robot_description',
-                   '-timeout', '120'],
+                   '-timeout', '120', '-z', '0.25'],
         output='screen'
     )
 
@@ -70,7 +71,8 @@ def generate_launch_description():
             'target_frame': 'base_link',
             'transform_tolerance': 0.01,
             'min_height': -0.05,
-            'max_height': 1.0,
+            # 【改动】同 navigation.launch.py：max_height 0.80 滤掉雷达自身安装面的回波
+            'max_height': 0.80,
             'angle_min': -3.141592653589793,
             'angle_max': 3.141592653589793,
             'angle_increment': 0.0174532925199433,
