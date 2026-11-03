@@ -17,8 +17,12 @@ sleep 2
 source /opt/ros/humble/setup.bash
 source install/setup.bash
 
-# 本机（VMware 虚拟显卡 + Qt GTK 主题）需要的环境变量，否则 rviz2 崩溃
-export GSETTINGS_SCHEMA_DIR=/home/rostwo/.local/share/glib-2.0/schemas
+# 本机（虚拟显卡 + Qt GTK 主题）需要的环境变量，否则 rviz2 崩溃
+# 【改动】原路径硬编码为 /home/rostwo，本机不存在该目录；指向不存在的
+# GSETTINGS_SCHEMA_DIR 会让 GTK 找不到系统 schema，反而更容易崩。
+if [ -d "$HOME/.local/share/glib-2.0/schemas" ]; then
+  export GSETTINGS_SCHEMA_DIR="$HOME/.local/share/glib-2.0/schemas"
+fi
 export QT_QPA_PLATFORM=xcb
 
 # 启动完整导航

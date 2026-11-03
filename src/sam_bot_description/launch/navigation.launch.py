@@ -70,7 +70,11 @@ def generate_launch_description():
     spawn_entity = Node(
         package='gazebo_ros',
         executable='spawn_entity.py',
-        arguments=['-topic', 'robot_description', '-entity', 'sam_bot'],
+        # 【改动】-timeout 从默认 30s 放宽到 120s：本机 gzserver 首次加载世界
+        # 可能超过 30s，spawn_entity 等不到 /spawn_entity 服务会直接报错退出，
+        # 导致机器人没生成、/livox/* 无数据、FAST-LIO 没有 odom。
+        arguments=['-topic', 'robot_description', '-entity', 'sam_bot',
+                   '-timeout', '120'],
         output='screen'
     )
 

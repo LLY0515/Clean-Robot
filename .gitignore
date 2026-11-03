@@ -20,3 +20,6 @@ __pycache__/
 src/fast_lio/Log/*.txt
 src/fast_lio/PCD/
 *.pcd
+
+# Windows/WSL 复制文件产生的元数据（形如 foo:Zone.Identifier）
+*Zone.Identifier*

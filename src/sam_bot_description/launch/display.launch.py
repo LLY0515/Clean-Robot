@@ -40,7 +40,9 @@ def generate_launch_description():
     spawn_entity = launch_ros.actions.Node(
         package='gazebo_ros',
         executable='spawn_entity.py',
-        arguments=['-entity', 'sam_bot', '-topic', 'robot_description'],
+        # 【改动】-timeout 放宽到 120s，避免 gzserver 启动慢时 spawn 服务还没就绪就退出。
+        arguments=['-entity', 'sam_bot', '-topic', 'robot_description',
+                   '-timeout', '120'],
         output='screen'
     )
 
