@@ -20,6 +20,8 @@ __pycache__/
 src/fast_lio/Log/*.txt
 src/fast_lio/PCD/
 *.pcd
+# 例外：3D 重定位用的先验地图是运行必需资产，随仓库提供。
+!src/sam_bot_description/map/prior_3d_map.pcd
 
 # Windows/WSL 复制文件产生的元数据（形如 foo:Zone.Identifier）
 *Zone.Identifier*

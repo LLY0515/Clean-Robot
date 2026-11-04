@@ -1,48 +1,13 @@
-amcl:
-  ros__parameters:
-    use_sim_time: True
-    alpha1: 0.1
-    alpha2: 0.1
-    alpha3: 0.1
-    alpha4: 0.1
-    alpha5: 0.2
-    base_frame_id: "base_footprint"
-    beam_skip_distance: 0.5
-    beam_skip_error_threshold: 0.9
-    beam_skip_threshold: 0.3
-    do_beamskip: false
-    global_frame_id: "map"
-    lambda_short: 0.1
-    laser_likelihood_max_dist: 2.0
-    laser_max_range: 15.0
-    laser_min_range: 0.1
-    laser_model_type: "likelihood_field"
-    max_beams: 120
-    max_particles: 2000
-    min_particles: 500
-    odom_frame_id: "odom"
-    pf_err: 0.05
-    pf_z: 0.99
-    recovery_alpha_fast: 0.0
-    recovery_alpha_slow: 0.0
-    resample_interval: 1
-    robot_model_type: "nav2_amcl::DifferentialMotionModel"
-    save_pose_rate: 0.5
-    sigma_hit: 0.2
-    tf_broadcast: true
-    transform_tolerance: 1.0
-    update_min_a: 0.2
-    # 【改动】0.25→0.15：AMCL 在机器人每移动 0.15m 就更频繁地做测量校正，
-    # 减少运动过程中 map->odom 校正的滞后（此前运动时定位误差 0.3~0.75m）。
-    update_min_d: 0.15
-    # 【改动】z_hit/z_rand 从 0.5/0.5 改回 0.95/0.05：原值让 AMCL 认为
-    # 一半激光束是纯随机噪声，测量权重几乎拉平，粒子滤波在稀疏 /scan 下
-    # 收敛不住、map->odom 会大范围跳变（实测 9~14m），是可见「飘」的主因。
-    z_hit: 0.95
-    z_max: 0.05
-    z_rand: 0.05
-    z_short: 0.05
-    scan_topic: scan
+# ============================================================================
+#  【改动】AMCL 已移除。
+#  全局定位改由 fastlio_localization/relocalization_node 完成：它把
+#  FAST-LIO 的 /cloud_registered（odom 系点云）与先验 3D 地图
+#  （map/prior_3d_map.pcd）做全局搜索 + ICP，直接发布 map->odom。
+#  参数见 fastlio_localization/config/relocalization_params.yaml。
+#
+#  说明：nav2_params.yaml 里不再保留 amcl 段；map_server 段仍然保留，
+#  navigation.launch.py 会单独启动 map_server 并覆盖 yaml_filename。
+# ============================================================================
 
 bt_navigator:
   ros__parameters:
@@ -241,7 +206,9 @@ local_costmap:
           #   * User chosen topic is `scan`.
           #   * Topic will be remapped to `/tb4/scan` without `local_costmap`.
           #   * Use global topic `/scan` if you do not wish the node namespace to apply
-          topic: scan
+          # 【修正】相对名 `scan` 会被解析成 /<costmap>/scan（0 个发布者），障碍层
+          # 收不到任何激光，局部避障完全失效；必须写绝对话题 /scan。
+          topic: /scan
           max_obstacle_height: 2.0
           clearing: True
           marking: True
@@ -280,7 +247,9 @@ global_costmap:
           #   * User chosen topic is `scan`.
           #   * Topic will be remapped to `/tb4/scan` without `global_costmap`.
           #   * Use global topic `/scan` if you do not wish the node namespace to apply
-          topic: scan
+          # 【修正】相对名 `scan` 会被解析成 /<costmap>/scan（0 个发布者），障碍层
+          # 收不到任何激光，局部避障完全失效；必须写绝对话题 /scan。
+          topic: /scan
           max_obstacle_height: 2.0
           clearing: True
           marking: True
@@ -421,7 +390,7 @@ collision_monitor:
     observation_sources: ["scan"]
     scan:
       type: "scan"
-      topic: "scan"
+      topic: "/scan"      # 同理：绝对话题，避免解析成 /collision_monitor/scan
       min_height: 0.15
       max_height: 2.0
       enabled: True

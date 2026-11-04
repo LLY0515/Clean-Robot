@@ -26,6 +26,8 @@
   <exec_depend>mid360_simulation</exec_depend>
   <exec_depend>pointcloud_to_laserscan</exec_depend>
   <exec_depend>fast_lio</exec_depend>
+  <!-- 【改动】3D 点云重定位节点（PCL 全局搜索 + ICP），替代 AMCL 发布 map->odom。 -->
+  <exec_depend>fastlio_localization</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

@@ -1,6 +1,6 @@
 # sam_bot_description 仿真架构说明
 
-本文档详细说明 `sam_bot_description` 包如何从**机器人 URDF 模型**出发，经过 **Gazebo 插件**、**里程计/IMU 数据融合（EKF）**，再到**建图（SLAM）**与**导航规划（Nav2）**的完整链路，并解释各文件之间的调用关系、TF 关系与数据流通关系。
+本文档详细说明仿真系统如何从**机器人 URDF 模型**出发，经过 **Gazebo 插件**、**FAST-LIO 激光惯性里程计**、**3D 点云重定位**，再到**建图（2D SLAM / 3D PCD）**与**导航规划（Nav2）**的完整链路，并解释各文件之间的调用关系、TF 关系与数据流通关系。
 
 ---
 
@@ -9,9 +9,9 @@
 1. [项目总览](#1-项目总览)
 2. [机器人模型构建（URDF）](#2-机器人模型构建urdf)
 3. [Gazebo 插件：传感器与执行器](#3-gazebo-插件传感器与执行器)
-4. [里程计与 IMU 数据融合（EKF）](#4-里程计与-imu-数据融合ekf)
+4. [FAST-LIO 里程计与 3D 重定位](#4-fast-lio-里程计与-3d-重定位)
 5. [TF 坐标关系](#5-tf-坐标关系)
-6. [建图（SLAM → 地图保存）](#6-建图slam--地图保存)
+6. [建图（2D 栅格图 / 3D 先验点云）](#6-建图2d-栅格图--3d-先验点云)
 7. [导航规划（Nav2）](#7-导航规划nav2)
 8. [文件调用关系](#8-文件调用关系)
 9. [数据流通关系总图](#9-数据流通关系总图)
@@ -20,34 +20,42 @@
 
 ## 1. 项目总览
 
-**技术栈**：ROS2 Humble + Gazebo Classic（gzserver/gzclient）+ robot_localization（EKF）+ Nav2（MPPI / Navfn / AMCL）。
+**技术栈**：ROS2 Humble + Gazebo Classic（gzserver/gzclient）+ FAST-LIO（LiDAR+IMU 紧耦合里程计）+ fastlio_localization（3D 点云重定位）+ Nav2（MPPI / Navfn）。AMCL 与 robot_localization EKF 均已移除。
 
-**目录结构**：
+**目录结构**（工作区 `src/`）：
 
 ```
-sam_bot_description/
-├── package.xml                         # 包依赖声明
-├── CMakeLists.txt                      # colcon 构建与安装规则
-├── src/
+src/
+├── sam_bot_description/                # 机器人描述 + 导航配置包
+│   ├── package.xml / CMakeLists.txt    # 包依赖声明 / colcon 安装规则
 │   ├── description/
 │   │   └── sam_bot_description.urdf    # 机器人模型 + Gazebo 插件（xacro 格式）
 │   ├── launch/
-│   │   ├── navigation.launch.py        # 完整导航仿真启动（Gazebo + EKF + Nav2 + RViz）
-│   │   └── display.launch.py           # 模型显示 / 建图启动（Gazebo + RSP + EKF + RViz）
+│   │   ├── navigation.launch.py        # 完整导航仿真（Gazebo + FAST-LIO + 重定位 + Nav2 + RViz）
+│   │   └── display.launch.py           # 模型显示 / 建图启动（Gazebo + RSP + FAST-LIO + RViz）
 │   ├── config/
-│   │   ├── ekf.yaml                    # robot_localization EKF 融合配置
-│   │   └── nav2_params.yaml            # Nav2 全套导航参数
+│   │   ├── nav2_params.yaml            # Nav2 全套导航参数（无 amcl 段）
+│   │   └── mapper_params_online_async.yaml  # slam_toolbox 在线建图参数
 │   ├── rviz/
 │   │   └── urdf_config.rviz            # display.launch.py 用的 RViz 配置
 │   ├── world/
 │   │   └── my_world.sdf                # Gazebo 世界（围墙 + 障碍物）
 │   └── map/
-│       ├── my_map.yaml                 # 地图元数据（分辨率/原点）
-│       └── my_map.pgm                  # 地图栅格图像（占用网格）
-└── install/                            # colcon 安装产物（构建后生成）
+│       ├── my_map.yaml                 # 2D 地图元数据（分辨率/原点）
+│       ├── my_map.pgm                  # 2D 地图栅格图像（占用网格）
+│       └── prior_3d_map.pcd            # 3D 先验点云（重定位用）
+├── fast_lio/                           # FAST-LIO 里程计包
+│   └── config/
+│       ├── mid360_sim.yaml             # 导航用参数（lidar_type=4）
+│       └── mid360_sim_mapping.yaml     # 建图用参数（pcd_save_en / map_en）
+├── fastlio_localization/               # 3D 点云重定位包（替代 AMCL）
+│   ├── src/relocalization_node.cpp
+│   ├── config/relocalization_params.yaml
+│   └── tools/auto_drive_map.py
+└── mid360_simulation/                  # Livox Mid-360 仿真插件包
 ```
 
-**依赖（package.xml 摘录）**：
+**依赖（`sam_bot_description/package.xml` 摘录）**：
 
 | 依赖 | 用途 |
 |------|------|
@@ -55,8 +63,10 @@ sam_bot_description/
 | `robot_state_publisher` | 从 URDF + joint_states 发布机器人 TF |
 | `joint_state_publisher` | 发布非仿真关节状态（display 用） |
 | `gazebo_ros` / `gazebo_plugins` | Gazebo 仿真与传感器/驱动插件 |
-| `robot_localization` | EKF 里程计+IMU 融合 |
+| `fast_lio` | LiDAR+IMU 紧耦合里程计，发布 odom→base_link |
+| `fastlio_localization` | 3D 点云重定位，发布 map→odom |
 | `nav2_bringup` / `nav2_rviz_plugins` | 导航栈与 RViz 导航插件 |
+| `slam_toolbox` | 2D 建图（`build_map.sh`，运行期不启动） |
 | `tf2_ros` | TF 坐标变换 |
 
 ---
@@ -151,7 +161,8 @@ URDF 里的 `<gazebo>` 标签在机器人被 spawn 进 Gazebo 时生效，每个
 
 - **订阅** `/cmd_vel`（`geometry_msgs/Twist`），把线速度 `vx` 和角速度 `wz` 换算成左右轮转速驱动轮子。
 - **发布** `/demo/odom`（`nav_msgs/Odometry`），由轮子转角积分得到里程计（x、y 位置 + 航向 yaw）。
-- `publish_odom_tf=false`：**故意不让 diff_drive 发 odom→base_link 的 TF**，这段 TF 改由 EKF 发布（见第 4 节），这样才能用 IMU 校正里程计漂移。
+- `publish_odom_tf=false`：**故意不让 diff_drive 发 odom→base_link 的 TF**，这段 TF 改由 FAST-LIO 发布（见第 4 节），用 LiDAR+IMU 代替轮式里程计。
+- **已知残余漂移**：`cmd_vel=0` 时 diff_drive 只把目标轮速设为 0、不抱死，车体会以约 **13 cm/min** 缓慢滑行（无指令）。FAST-LIO 实时跟随、不影响定位，但车在 Gazebo 里「停不死」。如需精确驻停，给驱动轮关节加大 `damping` 或加抱死摩擦。详见 [运行文档 §6.14](运行文档.md)。
 
 ### 3.2 IMU 传感器
 
@@ -160,64 +171,56 @@ URDF 里的 `<gazebo>` 标签在机器人被 spawn 进 Gazebo 时生效，每个
 
 ### 3.3 激光雷达
 
-- 发布 `/livox/lidar`（`sensor_msgs/PointCloud2`，10 Hz），`frame_id: livox`，由 `libmid360_plugin.so` 按 `mid360.csv` 定义的非重复扫描轨迹生成 3D 点云，量程 0.1~5.0 m。
-- Nav2 只认 2D 激光，故 launch 里另起 `pointcloud_to_laserscan` 节点把 `/livox/lidar` 投影成 `/scan`（`LaserScan`，frame `base_link`，10 Hz，量程 0.1~5.0 m）。
+- 发布 `/livox/lidar`（`sensor_msgs/PointCloud2`，10 Hz），`frame_id: livox`，由 `libmid360_plugin.so` 按 `mid360.csv` 定义的非重复扫描轨迹生成 3D 点云，量程 0.1~15.0 m。
+- Nav2 只认 2D 激光，故 launch 里另起 `pointcloud_to_laserscan` 节点把 `/livox/lidar` 投影成 `/scan`（`LaserScan`，frame `base_link`，10 Hz，量程 0.1~15.0 m）。
 
 ---
 
-## 4. 里程计与 IMU 数据融合（EKF）
+## 4. FAST-LIO 里程计与 3D 重定位
 
-文件：`src/sam_bot_description/config/ekf.yaml`，由 `navigation.launch.py` 启动 `ekf_filter_node`（robot_localization）。
+定位链路分两层（取代原来的 EKF + AMCL）：
 
-### 4.1 为什么需要 EKF
-
-`diff_drive` 只输出**轮式里程计**，它有两个问题：
-
-1. 长时间会漂移（轮子打滑、累计误差）；
-2. 没有绝对航向参考。
-
-EKF 把**轮式里程计**和 **IMU** 融合，得到更稳的位姿估计，并发布 `odom → base_link` 的 TF。
-
-### 4.2 ekf.yaml 核心配置
-
-```yaml
-frequency: 30.0
-two_d_mode: true              # 平面差分车：只估计 x / y / yaw
-
-odom_frame: odom
-base_link_frame: base_link
-world_frame: odom
-
-odom0: demo/odom              # 轮式里程计
-odom0_config: [true, true, false,   # x, y 位置融合
-               false, false, false, # 姿态不融合
-               false, false, false, # 线速度不融合
-               false, false, true,  # yaw 角速度融合
-               false, false, false] # 加速度不融合
-
-imu0: livox/imu                # IMU
-imu0_config: [false, false, false, # 位置不融合
-              false, false, true,  # yaw 姿态融合（关键）
-              false, false, false, # 线速度不融合
-              false, false, false, # 角速度不融合
-              false, false, false] # 加速度不融合
+```
+/livox/lidar + /livox/imu ──► FAST-LIO ──► TF: odom→base_link（10 Hz）
+                                    └────► /cloud_registered（odom 系去畸变点云）
+                                                    │
+prior_3d_map.pcd ──► fastlio_relocalization ──► TF: map→odom（10 Hz）
 ```
 
-### 4.3 融合矩阵解读
+- **里程计层**（`fast_lio`）：LiDAR+IMU 紧耦合 iEKF，输出高频、低漂移的 `odom→base_link`；
+- **全局定位层**（`fastlio_localization`）：把实时点云与先验 PCD 做 ICP，求 `map→odom`。
 
-`*_config` 是 15 个布尔值，依次对应：`x/y/z 位置、roll/pitch/yaw 姿态、vx/vy/vz 线速度、roll/pitch/yaw 角速度、ax/ay/az 线加速度`。
+### 4.1 为什么用 FAST-LIO 替代轮式里程计 + EKF
 
-| 传感器 | 融合的状态量 | 作用 |
-|--------|-------------|------|
-| `odom0`（里程计） | x 位置、y 位置、yaw 角速度 | 提供平面位移 + 转向速率 |
-| `imu0`（IMU） | yaw 姿态 | 提供绝对航向，抑制里程计航向漂移 |
+`diff_drive` 只输出轮式里程计，长时间会漂移且没有绝对航向参考。原方案用 EKF 融合 IMU 的 yaw 只能部分缓解；FAST-LIO 直接对 LiDAR 点云做**帧到地图的迭代误差状态卡尔曼滤波**，在纯旋转、打滑时也比轮式里程计稳，同时给出 3D 点云地图。AMCL 依赖稀疏的 2D `/scan` 与栅格地图，在正方围墙 + 少量障碍物的世界里角度歧义明显；改用 3D 点云重定位后不再需要人工给初始位姿。
 
-> `two_d_mode: true` 是**必须的**：URDF 里 diff_drive 的 odom 只有 x/y/yaw 有效，若用默认 3D 模式融合 IMU 姿态和 odom 的 z，会导致高度状态发散（历史上一度 z 漂到 −70m，引起导航中止）。
+### 4.2 FAST-LIO 配置要点（`fast_lio/config/mid360_sim.yaml`）
 
-EKF 输出：
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| `common.lid_topic` / `imu_topic` | `/livox/lidar` / `/livox/imu` | 输入 |
+| `preprocess.lidar_type` | 4 | 标准 `PointCloud2` 输入（Livox 自定义格式用 1） |
+| `mapping.gyr_cov` | **0.01** | 仿真陀螺几乎无噪声；默认 0.1 会让纯旋转 yaw 明显低估 |
+| `mapping.extrinsic_R` | Ry(+30°) | 雷达物理前倾 30°，IMU 水平安装，补偿这 30° |
+| `mapping.extrinsic_T` | `[0.0125, −0.0233, 0.0437]` | IMU 在雷达系中的位置（反向旋转后） |
+| `mapping.body_to_base_T` | `[0.3335, 0.0233, 0.8863]` | IMU 在 `base_link` 中的位置。FAST-LIO 状态是 IMU 位姿，发布 `odom→base_link` 时右乘 `T_base_imu⁻¹` 换算成真正的车体原点，否则 RViz/Nav2 足迹整体前移 0.33 m |
+| `mapping.body_to_base_R` | 单位阵（9 元素行主序） | IMU 与 `base_link` 姿态一致（`livox` 的 +30° 被 `livox_imu` 的 −30° 抵消）。缺省为 `I`/`0`，向后兼容 |
+| `publish.dense_publish_en` | **true** | `/cloud_registered` 发去畸变全帧（~590 点）而非降采样特征（~100 点），重定位 ICP 更稳 |
+| `pcd_save.pcd_save_en` | `false`（导航）/ **`true`**（建图配置） | 建图时把累积点云存成 PCD |
 
-- **TF**：`odom → base_link`（`publish_tf: true`）；
-- **话题**：`/odometry/filtered`（滤波后的里程计）。
+### 4.3 3D 重定位算法（`fastlio_localization/relocalization_node.cpp`）
+
+节点是纯 C++（PCL），核心流程：
+
+1. **加载先验地图**：`pcl::io::loadPCDFile` 读入 `prior_3d_map.pcd`（`PointXYZI`），体素下采样到 0.15 m；同时预计算地图的最高点 `map_max_.z`，并提取 `z >= map_max_.z - global_search_height` 的**上部结构子图**（本项目 0.35 m：墙顶、箱顶、球顶），供全局搜索评分用。
+2. **全局搜索**（启动时或 `/relocalize`）：在 (x, y, yaw) 三维栅格上以 0.5 m / 15° 步长枚举候选，用**上部结构**的点云做快速内点率评分，取 `global_search_top_k`（8）个候选。
+3. **ICP 精配准**：对每个候选用完整实时帧做 `pcl::IterativeClosestPoint`（对应距离 1.5 m），再用上部结构重新评分排序；内点率低于 `min_inlier_ratio`（0.55）判为失败。若第二候选分数 ≥ 最优的 90% 且位姿不同，打印**歧义告警**。
+4. **逐帧跟踪**：以上一帧 `map→odom` 为初值做 ICP（对应距离 0.7 m），内点率达标且相对上一帧的平移 < 1.0 m、yaw < 0.6 rad 才接受；结果按 `correction_alpha`（0.6）平滑。
+5. **失败恢复**：连续 5 帧失败自动重新触发全局搜索。
+6. **平面约束**：地面机器人只保留 x/y/yaw（`constrain_planar`）。
+7. **输出**：10 Hz 发布 `map→odom`（时间戳 `now + 0.2 s`）、`/localization_pose`、`/aligned_scan`（配准后的点云）；`/prior_map` 以 transient_local QoS 发布先验地图；`/relocalize`（`std_srvs/Trigger`）可手动触发。
+
+> 启动时先发布单位阵 `map→odom`，保证 Nav2 生命周期管理阶段 TF 链完整。
 
 ---
 
@@ -240,40 +243,54 @@ map ──► odom ──► base_link ──► base_footprint
 
 | TF | 发布者 | 来源 |
 |----|--------|------|
-| `map → odom` | **AMCL** | 激光扫描与静态地图匹配，得到全局定位 |
-| `odom → base_link` | **EKF**（`ekf_filter_node`） | 里程计 + IMU 融合 |
+| `map → odom` | **fastlio_relocalization** | 实时点云与先验 PCD 做 ICP，得到全局定位 |
+| `odom → base_link` | **FAST-LIO**（`fastlio_mapping`） | LiDAR + IMU 紧耦合 iEKF |
 | `base_link → 所有子 link` | **robot_state_publisher** | 解析 URDF 的 joint |
+
+> FAST-LIO 的 `base_link` 实际就是 IMU 位姿（雷达位置约在物理 base_link 前方 0.346 m），重定位节点求出的 `map→odom` 也以这个 `base_link` 为参考，两者一致，Nav2 无需关心偏移。
 
 ### 5.3 base_link vs base_footprint
 
 - `base_link`：车体本体坐标系（URDF 树根）。
 - `base_footprint`：base_link 正下方 −0.15 m 处的地面投影点，是 2D 导航的"机器人中心"。
-- AMCL 用 `base_frame_id: base_footprint`，代价地图/控制器用 `robot_base_frame: base_link`，两者靠 `base_link → base_footprint` 固定 TF 连接，等价可用。
+- 重定位节点以 `base_link` 为参考帧，代价地图/控制器用 `robot_base_frame: base_link`，两者一致。
 
 ### 5.4 坐标意义
 
 | 坐标系 | 含义 |
 |--------|------|
-| `map` | 全局固定世界坐标系（与静态地图对齐） |
-| `odom` | 里程计坐标系（机器人出发点为原点，会漂移） |
+| `map` | 全局固定世界坐标系（与 2D 地图 / 3D 先验点云对齐） |
+| `odom` | FAST-LIO 里程计坐标系（启动时与 map 重合，之后缓慢漂移） |
 | `base_link` / `base_footprint` | 机器人本体坐标系 |
 
-AMCL 发布的 `map → odom` 变换，就是"把会漂移的 odom 坐标系对齐到全局 map 坐标系"的那层校正。
+重定位节点发布的 `map → odom`，就是"把会漂移的 odom 坐标系对齐到全局 map 坐标系"的那层校正；导航时的定位误差主要来自这一层。
 
 ---
 
-## 6. 建图（SLAM → 地图保存）
+## 6. 建图（2D 栅格图 / 3D 先验点云）
 
-> 说明：原 `src/sam_bot_description/config/slam.yaml` 已删除（本项目当前用预建地图导航，不再走 SLAM）。以下是历史建图流程，用于说明地图从哪来。
+> 说明：导航运行期不启动任何 SLAM 节点，以下两条离线链路分别生成本项目用到的两份地图。
 
-### 6.1 建图流程
+### 6.1 2D 建图流程（`build_map.sh`）
 
-1. 用 `display.launch.py` 启动 Gazebo + `robot_state_publisher` + EKF + RViz；
+1. 用 `display.launch.py` 启动 Gazebo + `robot_state_publisher` + FAST-LIO + RViz；
 2. 运行 `slam_toolbox`（online async 模式）订阅 `/scan` 和 TF，发布 `map → odom` 变换与 `/map` 话题；
 3. 手动控制机器人（如 `teleop_twist_keyboard` 发 `/cmd_vel`）遍历环境；
 4. 用 `nav2_map_server` 的 `map_saver` 把 `/map` 保存成文件。
 
-### 6.2 地图文件（src/sam_bot_description/map/my_map.yaml）
+### 6.2 3D 先验点云流程（`build_3d_map.sh`）
+
+1. 用 `mid360_sim_mapping.yaml` 启动 FAST-LIO（打开 `pcd_save_en` 与 `publish.map_en`）；
+2. 用 `fastlio_localization/tools/auto_drive_map.py` 或键盘遥控遍历环境，FAST-LIO 在 `odom` 系累积点云并发布 `/Laser_map`；
+3. 调用 `/map_save` 服务，把累积点云写成 `src/sam_bot_description/map/prior_3d_map.pcd`；
+4. **平移 PCD**：`tools/shift_pcd.py` 把 x/y 加上 `(0.3335, 0.0233) m`。FAST-LIO 的 `odom` 原点是建图起点的 **IMU**，而 2D 栅格地图的原点是 **base_link**（世界原点），不平移会让 3D 重定位的 `map` 与 `map_server` 的地图错开一个 IMU 安装偏移。z 不平移（保持雷达平面为 0，与重定位的 `constrain_planar` 一致）。脚本每次先删旧 PCD 再保存，不会重复平移；
+5. PCD 的坐标系现在是建图起点的 `base_link`，也就是导航时 2D 地图的 `map` 系。
+
+> 2D 地图与 3D 先验点云必须来自**同一次起点**的建图（都在世界原点附近出发），否则 `map` 不一致。详见 [运行文档 §3.4](运行文档.md)。
+>
+> 自检：静止时 `tf2_echo map base_link` 的 x/y/yaw 应与 `gz model -m sam_bot -p` 的真值基本一致（< 0.2 m）；若差约 0.33 m，说明 PCD 是平移前的旧文件，需重建或手动跑一次 `shift_pcd.py`。
+
+### 6.3 2D 地图文件（`src/sam_bot_description/map/my_map.yaml`）
 
 ```yaml
 image: my_map.pgm
@@ -293,14 +310,14 @@ free_thresh: 0.25
 
 ## 7. 导航规划（Nav2）
 
-导航由 `navigation.launch.py` 调用 `nav2_bringup` 的 `bringup_launch.py` 启动，参数全部在 `src/sam_bot_description/config/nav2_params.yaml`。
+导航由 `navigation.launch.py` 调用 `nav2_bringup` 的 `navigation_launch.py` 启动（**不含 AMCL**），参数全部在 `src/sam_bot_description/config/nav2_params.yaml`。`map_server` 单独启动，并由一个独立的 `lifecycle_manager_localization` 管理（延迟 5 s 启动，避开启动阶段的 DDS 发现竞态）。
 
 ### 7.1 Nav2 各节点职责
 
 | 节点 | 插件/算法 | 职责 |
 |------|-----------|------|
-| `map_server` | — | 读取 `my_map.yaml`，发布 `/map`（静态地图） |
-| `amcl` | 粒子滤波 | 用 `/scan` + `/map` 定位，发布 `map→odom` TF |
+| `map_server` | — | 读取 `my_map.yaml`，发布 `/map`（静态地图，只给 global_costmap） |
+| `fastlio_relocalization` | 3D ICP | 用 `/cloud_registered` + 先验 PCD 定位，发布 `map→odom` TF |
 | `planner_server` | NavfnPlanner | 全局路径规划（在全局代价地图上 A*/Dijkstra） |
 | `controller_server` | MPPI | 局部路径跟踪，输出速度指令 |
 | `smoother_server` | SimpleSmoother | 平滑全局路径 |
@@ -344,8 +361,8 @@ behavior_server(恢复行为) ────────────────�
 5. `controller_server`（MPPI）结合 `local_costmap` 和路径，计算出速度指令 → `/cmd_vel_nav`；
 6. `velocity_smoother` 平滑限幅 → `/cmd_vel`；
 7. Gazebo `diff_drive` 执行速度，机器人移动；
-8. 轮子转动 → `/demo/odom` + `/joint_states`；IMU → `/livox/imu`；
-9. EKF 融合 → `odom→base_link` TF；AMCL 用 `/scan` 校正 → `map→odom` TF；
+8. 轮子转动 → `/joint_states`；IMU → `/livox/imu`；雷达 → `/livox/lidar`；
+9. FAST-LIO → `odom→base_link` TF + `/cloud_registered`；重定位节点做 ICP → `map→odom` TF；
 10. 代价地图更新、机器人到达目标（误差 < `xy_goal_tolerance` + `yaw_goal_tolerance` 即判定成功）。
 
 ---
@@ -361,11 +378,14 @@ ros2 launch sam_bot_description navigation.launch.py
 ├─ IncludeLaunch(gzclient.launch.py)   ← Gazebo 图形界面
 ├─ Node(robot_state_publisher)         ← 参数：xacro 展开后的 robot_description
 ├─ Node(spawn_entity.py)               ← 把机器人 spawn 进 Gazebo（-topic robot_description）
-├─ Node(ekf_filter_node)               ← 参数：config/ekf.yaml + use_sim_time
-├─ IncludeLaunch(nav2 bringup_launch.py) ← 参数：map + params_file + use_sim_time
-│    ├─ map_server      ← 加载 src/sam_bot_description/map/my_map.yaml
-│    ├─ amcl / planner_server / controller_server / bt_navigator / ...
+├─ Node(fastlio_mapping)               ← 参数：config/mid360_sim.yaml + use_sim_time
+├─ Node(pointcloud_to_laserscan)       ← /livox/lidar → /scan
+├─ IncludeLaunch(nav2 navigation_launch.py) ← 参数：params_file + use_sim_time（无 amcl）
+│    ├─ planner_server / controller_server / bt_navigator / ...
 │    └─ velocity_smoother
+├─ Node(map_server)                    ← 加载 map/my_map.yaml
+├─ TimerAction(5s) → Node(lifecycle_manager_localization) ← 只管理 map_server
+├─ Node(relocalization_node)           ← 参数：relocalization_params.yaml + prior_map_path
 └─ Node(rviz2)                          ← 加载 nav2_default_view.rviz
 ```
 
@@ -376,8 +396,9 @@ ros2 launch sam_bot_description navigation.launch.py
 | `navigation.launch.py` | `description/sam_bot_description.urdf` | 经 `Command(['xacro ', ...])` 展开成纯 URDF |
 | `navigation.launch.py` | `world/my_world.sdf` | Gazebo 世界 |
 | `navigation.launch.py` | `src/sam_bot_description/map/my_map.yaml` | 传给 map_server（经 Nav2 RewrittenYaml 改写 `yaml_filename`） |
+| `navigation.launch.py` | `src/sam_bot_description/map/prior_3d_map.pcd` | 传给 relocalization_node 的 `prior_map_path` |
 | `navigation.launch.py` | `config/nav2_params.yaml` | Nav2 全套参数 |
-| `navigation.launch.py` | `config/ekf.yaml` | EKF 融合参数 |
+| `navigation.launch.py` | `fastlio_localization/config/relocalization_params.yaml` | 3D 重定位参数 |
 | `display.launch.py` | `rviz/urdf_config.rviz` | RViz 显示配置 |
 
 ### 8.3 CMakeLists.txt 安装规则
@@ -398,7 +419,7 @@ install(DIRECTORY launch rviz description config world behavior_trees map
 ```
                     ┌───────────────────────── Gazebo 仿真 ─────────────────────────┐
                     │                                                                │
-   /cmd_vel ────► diff_drive 插件 ──► 轮子转动 ──► /demo/odom（轮式里程计）          │
+   /cmd_vel ────► diff_drive 插件 ──► 轮子转动 ──► /demo/odom（轮式里程计，仅调试）  │
                     │                     │                                          │
                     │                     └──► /joint_states（轮子转角）              │
                     │                                                                │
@@ -412,16 +433,17 @@ install(DIRECTORY launch rviz description config world behavior_trees map
 ### 9.2 融合与 TF 数据流
 
 ```
-/demo/odom ──┐
-             ├──► ekf_filter_node ──► TF: odom→base_link ──┐
-/livox/imu ───┘                                              │
-                                                            ├──► 完整 TF 树
-/joint_states ──► robot_state_publisher ──► TF: base_link→* ─┘
+/livox/lidar ──┐
+               ├──► fastlio_mapping ──► TF: odom→base_link ──┐
+/livox/imu ────┘                     └──► /cloud_registered   │
+                                                              ├──► 完整 TF 树
+/joint_states ──► robot_state_publisher ──► TF: base_link→* ──┘
                  （+ /robot_description）
 
-/scan ──┐
-        ├──► AMCL ──► TF: map→odom ──► 完整 TF 树
-/map ───┘        └──► /amcl_pose（定位结果）
+/cloud_registered ──┐
+                    ├──► fastlio_relocalization ──► TF: map→odom ──► 完整 TF 树
+prior_3d_map.pcd ───┘            ├──► /localization_pose（定位结果）
+                                 └──► /aligned_scan（配准后的点云）
 ```
 
 ### 9.3 导航数据流
@@ -448,22 +470,27 @@ local_costmap ──────────────────────
 |------|------|--------|-----------|
 | `/cmd_vel` | Twist | velocity_smoother、behavior_server | diff_drive |
 | `/cmd_vel_nav` | Twist | controller_server | velocity_smoother |
-| `/demo/odom` | Odometry | diff_drive | ekf_filter_node、velocity_smoother、bt_navigator |
-| `/livox/imu` | Imu | imu_sensor 插件 | ekf_filter_node |
-| `/livox/lidar` | PointCloud2 | mid360 插件 | pointcloud_to_laserscan |
-| `/scan` | LaserScan | pointcloud_to_laserscan（由 `/livox/lidar` 投影） | AMCL、global_costmap、local_costmap |
+| `/demo/odom` | Odometry | diff_drive | （仅调试用，导航不消费） |
+| `/livox/imu` | Imu | imu_sensor 插件 | fastlio_mapping |
+| `/livox/lidar` | PointCloud2 | mid360 插件 | fastlio_mapping、pointcloud_to_laserscan |
+| `/cloud_registered` | PointCloud2 | fastlio_mapping（odom 系、去畸变） | fastlio_relocalization |
+| `/Odometry` | Odometry | fastlio_mapping | 重定位节点（取时间戳/调试） |
+| `/scan` | LaserScan | pointcloud_to_laserscan（由 `/livox/lidar` 投影） | global_costmap、local_costmap |
 | `/joint_states` | JointState | joint_state_publisher 插件 | robot_state_publisher |
-| `/map` | OccupancyGrid | map_server | AMCL、global_costmap |
-| `/amcl_pose` | PoseWithCovarianceStamped | AMCL | RViz 等 |
-| `/odometry/filtered` | Odometry | ekf_filter_node | （可选） |
+| `/map` | OccupancyGrid | map_server | global_costmap |
+| `/prior_map` | PointCloud2 | fastlio_relocalization（transient_local） | RViz |
+| `/aligned_scan` | PointCloud2 | fastlio_relocalization | RViz |
+| `/localization_pose` | PoseWithCovarianceStamped | fastlio_relocalization | RViz 等 |
+| `/relocalize` | std_srvs/Trigger | — | fastlio_relocalization（手动触发全局重定位） |
 
 ---
 
 ## 附：一个完整导航周期的时间线
 
 1. **启动**：Gazebo 加载世界 → spawn 机器人 → 各插件开始发布传感器数据。
-2. **TF 建立**：robot_state_publisher 发 `base_link→*`；EKF 收到第一条 odom/imu 后发 `odom→base_link`。
-3. **地图加载**：map_server 发布 `/map`。
-4. **初始定位**：用户在 RViz 用 "2D Pose Estimate" 给 AMCL 初始位姿，AMCL 开始发 `map→odom`。
+2. **TF 建立**：robot_state_publisher 发 `base_link→*`；FAST-LIO 收到前几帧 LiDAR/IMU 后发 `odom→base_link`。
+3. **地图加载**：map_server（延迟 5 s 由 lifecycle manager 激活）发布 `/map`；重定位节点加载 `prior_3d_map.pcd` 并先发单位阵 `map→odom`。
+4. **初始定位**：`relocalize_on_start: true`，重定位节点自动做一次全局搜索 + ICP，成功后开始发真实 `map→odom`——**无需在 RViz 手动给初始位姿**。
 5. **下发目标**：RViz "2D Nav Goal" → bt_navigator 开始规划与跟踪。
-6. **运动闭环**：规划 → MPPI 跟踪 → 速度指令 → 机器人移动 → 里程计/IMU/激光回传 → TF 更新 → 代价地图更新 → 直到到达目标。
+6. **运动闭环**：规划 → MPPI 跟踪 → 速度指令 → 机器人移动 → LiDAR/IMU 回传 → FAST-LIO 更新 `odom→base_link` → 重定位节点更新 `map→odom` → 代价地图更新 → 直到到达目标。
+7. **跟踪丢失**：若连续 5 帧 ICP 内点率不足，节点自动重新全局搜索；也可手动调用 `/relocalize`。

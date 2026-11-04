@@ -31,6 +31,7 @@ def generate_launch_description():
         name='rviz2',
         output='screen',
         arguments=['-d', LaunchConfiguration('rvizconfig')],
+        condition=launch.conditions.IfCondition(LaunchConfiguration('rviz')),
         # 强制 GL 2.1 让 Ogre 退回旧版 RenderSystem_GL：rviz 的 Map/Costmap 着色器
         # 用了 sampler1D（1D 纹理），而 GL3+ core profile 已移除 1D 纹理，会导致
         # "active samplers with a different type refer to the same texture image unit" 崩溃。
@@ -41,9 +42,12 @@ def generate_launch_description():
         package='gazebo_ros',
         executable='spawn_entity.py',
         # 【改动】-timeout 放宽到 120s，避免 gzserver 启动慢时 spawn 服务还没就绪就退出。
-        # 【改动】-z 0.25：新 CAD 模型轮底在 base_link 系 z=-0.24，抬高后再落下。
+        # 【改动】-z 0.24：新 CAD 模型轮底在 base_link 系 z=-0.24。
+        # 这里与 navigation.launch.py 保持一致：-z 0.25 会先下落 1cm 再弹跳，
+        # 正好落在 FAST-LIO 的 IMU 静止初始化窗口里，污染重力估计。建 3D 先验
+        # 地图也用这个高度，才能和导航时的 odom 系 z 原点对齐。
         arguments=['-entity', 'sam_bot', '-topic', 'robot_description',
-                   '-timeout', '120', '-z', '0.25'],
+                   '-timeout', '120', '-z', '0.24'],
         output='screen'
     )
 
@@ -53,7 +57,15 @@ def generate_launch_description():
         executable='fastlio_mapping',
         name='fastlio_mapping',
         output='screen',
-        parameters=[fastlio_config, {'use_sim_time': LaunchConfiguration('use_sim_time')}]
+        # 【改动】参数文件与 map_file_path 都可从命令行覆盖：
+        #   ros2 launch ... display.launch.py \
+        #     fastlio_config:=.../mid360_sim_mapping.yaml \
+        #     fastlio_map_file:=/abs/path/prior_3d_map.pcd
+        # 建 3D 先验地图时用 mapping 配置（pcd_save_en:=true），
+        # 再由 build_3d_map.sh 调用 /map_save 服务把累积点云写成 PCD。
+        parameters=[LaunchConfiguration('fastlio_config'),
+                    {'use_sim_time': LaunchConfiguration('use_sim_time'),
+                     'map_file_path': LaunchConfiguration('fastlio_map_file')}]
     )
 
     # 【改动】把 Mid-360 的 3D 点云 (/livox/lidar) 投影成 2D 激光扫描 (/scan)。
@@ -95,6 +107,12 @@ def generate_launch_description():
                                             description='Absolute path to rviz config file'),
         launch.actions.DeclareLaunchArgument(name='use_sim_time', default_value='True',
                                             description='Flag to enable use_sim_time'),
+        launch.actions.DeclareLaunchArgument(name='rviz', default_value='True',
+                                            description='Flag to enable rviz2'),
+        launch.actions.DeclareLaunchArgument(name='fastlio_config', default_value=fastlio_config,
+                                            description='FAST-LIO parameter file'),
+        launch.actions.DeclareLaunchArgument(name='fastlio_map_file', default_value='',
+                                            description='FAST-LIO map_file_path (PCD save target)'),
         launch.actions.ExecuteProcess(cmd=['gazebo', '--verbose', '-s', 'libgazebo_ros_init.so', '-s', 'libgazebo_ros_factory.so', world_path],
                                       output='screen'),
         joint_state_publisher_node,

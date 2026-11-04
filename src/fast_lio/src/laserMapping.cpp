@@ -128,6 +128,13 @@ V3D position_last(Zero3d);
 V3D Lidar_T_wrt_IMU(Zero3d);
 M3D Lidar_R_wrt_IMU(Eye3d);
 
+// FAST-LIO 的状态 state_point 是 IMU(机体)位姿，而 URDF/Nav2 的基准是 base_link。
+// IMU 装在 base_link 前上方（本项目 (0.3335, 0.0233, 0.8863) m，姿态与 base_link 对齐）。
+// 发布 odom→base_link 和 /Odometry 时右乘 T_base_imu^{-1}，换算成真正的 base_link；
+// 内部建图/配准仍使用 IMU 状态，不受影响。参数缺省为单位阵/零平移（向后兼容）。
+V3D Body_T_wrt_Base(Zero3d);
+M3D Body_R_wrt_Base(Eye3d);
+
 /*** EKF inputs and output ***/
 MeasureGroup Measures;
 esekfom::esekf<state_ikfom, 12, input_ikfom> kf;
@@ -576,14 +583,22 @@ void save_to_pcd()
 template<typename T>
 void set_posestamp(T & out)
 {
-    out.pose.position.x = state_point.pos(0);
-    out.pose.position.y = state_point.pos(1);
-    out.pose.position.z = state_point.pos(2);
-    out.pose.orientation.x = geoQuat.x;
-    out.pose.orientation.y = geoQuat.y;
-    out.pose.orientation.z = geoQuat.z;
-    out.pose.orientation.w = geoQuat.w;
-    
+    // state_point 是 IMU(机体)在 odom 系的位姿；T_world_base = T_world_imu * T_base_imu^{-1}
+    //   q_wb = q_wi * q_bi^{-1}，p_wb = p_wi - R_wb * t_bi
+    // 参数缺省时 q_bi=I、t_bi=0，输出与旧行为完全一致。
+    Eigen::Quaterniond q_wi(geoQuat.w, geoQuat.x, geoQuat.y, geoQuat.z);
+    Eigen::Quaterniond q_bi(Body_R_wrt_Base);
+    Eigen::Quaterniond q_wb = q_wi * q_bi.conjugate();
+    q_wb.normalize();
+    Eigen::Vector3d p_wb = Eigen::Vector3d(state_point.pos(0), state_point.pos(1), state_point.pos(2))
+                         - q_wb.toRotationMatrix() * Body_T_wrt_Base;
+    out.pose.position.x = p_wb.x();
+    out.pose.position.y = p_wb.y();
+    out.pose.position.z = p_wb.z();
+    out.pose.orientation.x = q_wb.x();
+    out.pose.orientation.y = q_wb.y();
+    out.pose.orientation.z = q_wb.z();
+    out.pose.orientation.w = q_wb.w();
 }
 
 void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
@@ -794,6 +809,8 @@ public:
         this->declare_parameter<int>("pcd_save.interval", -1);
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
+        this->declare_parameter<vector<double>>("mapping.body_to_base_T", vector<double>());
+        this->declare_parameter<vector<double>>("mapping.body_to_base_R", vector<double>());
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
@@ -830,6 +847,9 @@ public:
         this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
+        vector<double> body_to_base_T, body_to_base_R;
+        this->get_parameter_or<vector<double>>("mapping.body_to_base_T", body_to_base_T, vector<double>());
+        this->get_parameter_or<vector<double>>("mapping.body_to_base_R", body_to_base_R, vector<double>());
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
 
@@ -855,6 +875,10 @@ public:
 
         Lidar_T_wrt_IMU<<VEC_FROM_ARRAY(extrinT);
         Lidar_R_wrt_IMU<<MAT_FROM_ARRAY(extrinR);
+        if (body_to_base_T.size() == 3)
+            Body_T_wrt_Base<<VEC_FROM_ARRAY(body_to_base_T);
+        if (body_to_base_R.size() == 9)
+            Body_R_wrt_Base<<MAT_FROM_ARRAY(body_to_base_R);
         p_imu->set_extrinsic(Lidar_T_wrt_IMU, Lidar_R_wrt_IMU);
         p_imu->set_gyr_cov(V3D(gyr_cov, gyr_cov, gyr_cov));
         p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));

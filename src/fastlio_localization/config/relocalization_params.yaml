@@ -1,0 +1,58 @@
+# ============================================================================
+#  3D 重定位节点参数（fastlio_localization/relocalization_node）
+#
+#  地图来源：build_3d_map.sh 用 FAST-LIO 边跑边存下的 prior_3d_map.pcd，
+#            坐标系就是 FAST-LIO 建图时的 odom 系，等价于 map 系。
+# ============================================================================
+fastlio_relocalization:
+  ros__parameters:
+    use_sim_time: true
+
+    # 先验 PCD；navigation.launch.py 会用 map 目录下的绝对路径覆盖它。
+    prior_map_path: ""
+    # FAST-LIO 的 odom 系点云（已做去畸变），ICP 求出的就是 map->odom。
+    scan_topic: "/cloud_registered"
+    map_frame: "map"
+    odom_frame: "odom"
+    base_frame: "base_link"
+
+    # ---------------- 点云预处理 ----------------
+    map_voxel_size: 0.15          # 先验地图体素下采样（先验地图本身约 0.2 m 间距）
+    scan_voxel_size: 0.20         # 跟踪时当前帧下采样
+    global_scan_voxel_size: 0.45  # 全局搜索用的更稀疏帧，降低搜索耗时
+    min_scan_range: 0.5           # 过滤雷达自身/车体回波
+    max_scan_range: 15.0          # 与 Mid-360 仿真量程一致
+
+    # ---------------- ICP ----------------
+    icp_max_iterations: 30
+    icp_corr_dist_tracking: 0.7       # 跟踪：初值已经不错，对应距离不用太大
+    icp_corr_dist_relocalize: 1.5     # 重定位：栅格候选有 0.5 m 误差，放宽对应距离
+    inlier_distance: 0.35             # 最近邻距离小于它算内点
+    min_inlier_ratio: 0.55            # 内点率低于此值判为定位失败
+    relocalize_fail_count: 5          # 连续失败多少帧后重新全局搜索
+    max_tracking_jump: 1.0            # 单帧 map->odom 平移跳变上限 (m)
+    max_tracking_yaw_jump: 0.6        # 单帧偏航跳变上限 (rad)
+    correction_alpha: 0.6             # 跟踪结果平滑系数，1.0 = 不平滑
+    constrain_planar: true            # 地面机器人：map->odom 只保留 x/y/yaw
+
+    # ---------------- 全局搜索 ----------------
+    relocalize_on_start: true
+    global_search_xy_step: 0.5
+    global_search_yaw_step_deg: 15.0
+    global_search_margin: 0.6         # 候选位置离地图边缘至少 0.6 m
+    global_search_top_k: 8            # 粗搜索取前 8 个候选做 ICP 精配准
+    global_search_max_points: 200     # 粗搜索每帧最多用 200 点
+    # 只用地图最高点以下这段高度内的结构做全局搜索评分。
+    # 本项目雷达比 1 m 围墙还高且前倾 30°，点云里大部分是地面/墙脚；地面在
+    # (x, y, yaw) 上平移不变，会把“转了 90° 仍然贴着墙”的对称解抬高。取墙顶、
+    # 箱顶、球顶这些高处结构后，正方围墙里的角度歧义明显减小。
+    # 设成 <= 0 可关闭该过滤（退回整张地图搜索）。
+    global_search_height: 0.35
+
+    # ---------------- 输出 ----------------
+    publish_rate: 10.0                # map->odom TF 发布频率
+    # map->odom 的时间戳超前量。Nav2 会用“当前时刻”查 map->odom，若 TF 只打到
+    # now()，高频控制循环偶尔会报 extrapolation into the future；AMCL 的做法
+    # 是把时间戳打到 now + transform_tolerance，这里保持一致。
+    tf_future_stamp: 0.2
+    publish_aligned_scan: true        # 发布 /aligned_scan 方便 RViz 检查配准效果

@@ -1,0 +1,65 @@
+# ============================================================================
+#  FAST-LIO 建 3D 先验地图专用参数（仿真）
+#
+#  与 mid360_sim.yaml 的区别：
+#    - pcd_save.pcd_save_en: true —— 允许 /map_save 服务把累积地图写成 PCD；
+#    - filter_size_surf/map 0.5 → 0.2，point_filter_num 3 → 1 —— 地图更密，
+#      3D 重定位的 ICP 内点率更稳；
+#    - dense_publish_en: true —— /Laser_map 与内部累积都用完整去畸变点。
+#
+#  map_file_path 由 build_3d_map.sh 通过 launch 参数传入，这里留空。
+# ============================================================================
+/**:
+    ros__parameters:
+        feature_extract_enable: false
+        point_filter_num: 1
+        max_iteration: 4
+        filter_size_surf: 0.2
+        filter_size_map: 0.2
+        cube_side_length: 1000.0
+        runtime_pos_log_enable: false
+        map_file_path: ""
+
+        common:
+            lid_topic:  "/livox/lidar"
+            imu_topic:  "/livox/imu"
+            time_sync_en: false
+            time_offset_lidar_to_imu: 0.0
+
+        preprocess:
+            lidar_type: 4
+            scan_line:  4
+            blind: 0.5
+            timestamp_unit: 3
+            scan_rate: 10
+
+        mapping:
+            acc_cov: 0.1
+            gyr_cov: 0.01
+            b_acc_cov: 0.0001
+            b_gyr_cov: 0.0001
+            fov_degree:    360.0
+            det_range:     100.0
+            extrinsic_est_en:  false
+            extrinsic_T: [ 0.0125337, -0.02329, 0.0437090 ]
+            extrinsic_R: [ 0.8660254, 0., 0.5,
+                            0., 1., 0.,
+                           -0.5, 0., 0.8660254 ]
+            # 与 mid360_sim.yaml 一致：IMU 在 base_link 中的安装位姿（URDF 合成）。
+            # 建图只关心 odom 系点云，该参数只影响发布的 TF/路径。
+            body_to_base_T: [0.3334663, 0.02329, 0.886291]
+            body_to_base_R: [1., 0., 0.,
+                             0., 1., 0.,
+                             0., 0., 1.]
+
+        publish:
+            path_en: true
+            effect_map_en: false
+            map_en: true                 # 必须为 true：/map_save 保存的是内部累积的 pcl_wait_pub
+            scan_publish_en:  true
+            dense_publish_en: true
+            scan_bodyframe_pub_en: true
+
+        pcd_save:
+            pcd_save_en: true            # 允许 map_save 服务写 PCD
+            interval: -1

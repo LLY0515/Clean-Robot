@@ -1,7 +1,8 @@
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument
+from launch.actions import (IncludeLaunchDescription, DeclareLaunchArgument,
+                            TimerAction)
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, Command
 from launch_ros.actions import Node
@@ -13,6 +14,7 @@ def generate_launch_description():
     pkg_gazebo_ros = get_package_share_directory('gazebo_ros')
     pkg_nav2_bringup = get_package_share_directory('nav2_bringup')
     pkg_fast_lio_share = get_package_share_directory('fast_lio')
+    pkg_fastlio_localization = get_package_share_directory('fastlio_localization')
 
     # ================= 2. 定义文件路径 =================
     # 你的 URDF 模型路径 (安装后位于 share/<pkg>/description/ 下)
@@ -25,6 +27,11 @@ def generate_launch_description():
     param_file = os.path.join(pkg_share, 'config', 'nav2_params.yaml')
     # FAST-LIO 参数文件（仿真专用：lidar_type=4 走标准 PointCloud2 输入）
     fastlio_config = os.path.join(pkg_fast_lio_share, 'config', 'mid360_sim.yaml')
+    # 【改动】3D 先验地图与重定位参数：用 ICP 对先验 PCD 配准来发布 map->odom，
+    # 取代原来的 AMCL。地图由 build_3d_map.sh 生成。
+    prior_map_file = os.path.join(pkg_share, 'map', 'prior_3d_map.pcd')
+    relocalization_params = os.path.join(pkg_fastlio_localization, 'config',
+                                         'relocalization_params.yaml')
     
     # 使用 Nav2 官方自带的 RViz 配置文件（它已经配置好了所有代价地图、路径等显示项）
     rviz_config_file = os.path.join(pkg_nav2_bringup, 'rviz', 'nav2_default_view.rviz')
@@ -86,8 +93,8 @@ def generate_launch_description():
     )
 
     # (4.5) FAST-LIO：LiDAR + IMU 紧耦合里程计（替代原 robot_localization EKF）。
-    #       fastlio_mapping 发布 odom->base_link 的 TF（源码已把 camera_init->odom、body->base_link），
-    #       AMCL 继续负责 map->odom，两者解耦：里程计由 FAST-LIO 提供，全局定位由 AMCL 提供。
+    #       fastlio_mapping 发布 odom->base_link 的 TF；map->odom 由下面的
+    #       fastlio_relocalization（3D 点云重定位）发布，替代原来的 AMCL。
     #       注意：/demo/odom（轮式里程计）仍保留，供 Nav2 的 controller/velocity_smoother
     #       读取速度反馈（nav2_params.yaml 里 odom_topic 仍指向 /demo/odom）。
     fastlio_node = Node(
@@ -99,7 +106,8 @@ def generate_launch_description():
     )
 
     # (4.6) 【改动】把 Mid-360 的 3D 点云 (/livox/lidar) 投影成 2D 激光扫描 (/scan)，
-    #       供 Nav2 的 AMCL 与代价地图障碍层使用（它们只认 LaserScan）。
+    #       供 Nav2 的代价地图障碍层使用（它只认 LaserScan）。AMCL 已移除，
+    #       定位改用 /cloud_registered 的 3D 点云配准。
     pointcloud_to_laserscan = Node(
         package='pointcloud_to_laserscan',
         executable='pointcloud_to_laserscan_node',
@@ -133,16 +141,68 @@ def generate_launch_description():
         output='screen'
     )
 
-    # (5) 启动完整的 Nav2 导航栈
-    nav2_bringup = IncludeLaunchDescription(
+    # (5) 【改动】不再用 nav2_bringup/launch/bringup_launch.py：
+    #     它内部会在 slam:=false 时无条件启动 AMCL。这里改成自己组合：
+    #       - navigation_launch.py：controller/planner/bt_navigator 等导航节点；
+    #       - map_server + lifecycle_manager：只保留 2D 静态地图（代价地图要用）；
+    #       - fastlio_relocalization：用 3D 点云 ICP 发布 map->odom。
+    nav2_navigation = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
-            os.path.join(pkg_nav2_bringup, 'launch', 'bringup_launch.py')
+            os.path.join(pkg_nav2_bringup, 'launch', 'navigation_launch.py')
         ),
         launch_arguments={
             'use_sim_time': use_sim_time,
-            'map': map_file,
-            'params_file': param_file
+            'params_file': param_file,
+            'autostart': 'True',
         }.items()
+    )
+
+    # (5.1) 2D 静态栅格地图（Nav2 的 global_costmap static_layer 需要）
+    map_server = Node(
+        package='nav2_map_server',
+        executable='map_server',
+        name='map_server',
+        output='screen',
+        parameters=[param_file, {
+            'yaml_filename': map_file,
+            'use_sim_time': use_sim_time,
+        }],
+        remappings=[('/tf', 'tf'), ('/tf_static', 'tf_static')],
+    )
+
+    # (5.2) 只管理 map_server 的生命周期（原来 bringup 里还会管理 amcl）。
+    #       延迟几秒再拉起：lifecycle_manager 会在启动瞬间就去调 map_server 的
+    #       change_state 服务，此时 map_server 可能还没完成 DDS 发现（尤其是刚
+    #       重启过仿真、图里还残留上一轮的死端点时）。请求一旦丢失，在
+    #       use_sim_time 且 /clock 尚未开始的阶段这个等待不会超时，管理器会永远
+    #       卡在 "Configuring map_server"（表现为 global_costmap 收不到地图）。
+    #       延后 5 秒可确保 node 和服务都已发现。
+    lifecycle_manager_localization = TimerAction(
+        period=5.0,
+        actions=[Node(
+            package='nav2_lifecycle_manager',
+            executable='lifecycle_manager',
+            name='lifecycle_manager_localization',
+            output='screen',
+            parameters=[{
+                'use_sim_time': use_sim_time,
+                'autostart': True,
+                'node_names': ['map_server'],
+            }],
+        )],
+    )
+
+    # (5.3) 3D 重定位：启动时在先验 PCD 上做 (x, y, yaw) 全局搜索 + ICP，
+    #       之后持续跟踪并发布 map->odom TF，替代 AMCL。
+    relocalization_node = Node(
+        package='fastlio_localization',
+        executable='relocalization_node',
+        name='fastlio_relocalization',
+        output='screen',
+        parameters=[relocalization_params, {
+            'prior_map_path': prior_map_file,
+            'use_sim_time': use_sim_time,
+        }],
     )
 
     # (6) 启动 RViz2 并加载默认导航配置
@@ -171,6 +231,9 @@ def generate_launch_description():
         spawn_entity,
         fastlio_node,
         pointcloud_to_laserscan,
-        nav2_bringup,
+        nav2_navigation,
+        map_server,
+        lifecycle_manager_localization,
+        relocalization_node,
         rviz2
     ])

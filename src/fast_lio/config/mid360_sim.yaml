@@ -42,13 +42,27 @@
             extrinsic_R: [ 0.8660254, 0., 0.5,
                             0., 1., 0.,
                            -0.5, 0., 0.8660254 ]
+            # IMU(机体)在物理 base_link 系中的安装位置，由 URDF 链
+            #   base_link --(0.346,0,0.93, Ry30°)--> livox --(0.011,0.02329,-0.04412, Ry-30°)--> livox_imu
+            # 合成：R = I，t = (0.346,0,0.93) + Ry(30°)·(0.011,0.02329,-0.04412)
+            #          = (0.3334663, 0.02329, 0.886291)
+            # FAST-LIO 内部状态是 IMU 位姿；发布 odom→base_link 时右乘该外参的逆，
+            # 让 Nav2 足迹和 RViz 车模落在真实车体上（否则整体前移 0.33 m，
+            # 车尾超出足迹，出现“RViz 没撞、Gazebo 撞了”）。R 缺省单位阵。
+            body_to_base_T: [0.3334663, 0.02329, 0.886291]
+            body_to_base_R: [1., 0., 0.,
+                             0., 1., 0.,
+                             0., 0., 1.]
 
         publish:
             path_en: true                # true: publish Path
             effect_map_en: false         # true: publish Effects
             map_en: true                 # true: publish Map cloud
             scan_publish_en:  true       # false: close all the point cloud output
-            dense_publish_en: false      # false: low down the points number in a global-frame point clouds scan.
+            # 【改动】false→true：/cloud_registered 原先发的是 feats_down_body
+            # （0.5 m 体素降采样后每帧只剩一两百点），3D 重定位的 ICP 输入太稀。
+            # 改成 true 后发 feats_undistort（每帧 ~590 点），配准更稳。
+            dense_publish_en: true       # true: publish the full (undistorted) scan in global frame.
             scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
 
         pcd_save:
