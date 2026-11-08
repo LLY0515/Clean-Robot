@@ -42,7 +42,7 @@ AUTOSAVE_SEC=20                                      # 后台自动保存间隔�
 
 # ---------- 清理残留进程 ----------
 echo "[清理] 关闭残留的仿真/建图进程 ..."
-pkill -9 -f "gzserver|gzclient|robot_state_publisher|fastlio_mapping|pointcloud_to_laserscan|slam_toolbox|teleop_twist_keyboard|rviz2|joint_state_publisher|spawn_entity" 2>/dev/null || true
+pkill -9 -f "gzserver|gzclient|robot_state_publisher|fastlio_mapping|pointcloud_to_laserscan|slam_toolbox|rtabmap|teleop_twist_keyboard|rviz2|joint_state_publisher|spawn_entity" 2>/dev/null || true
 sleep 2
 
 # ---------- 环境 ----------

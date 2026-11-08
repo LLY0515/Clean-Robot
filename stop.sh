@@ -16,7 +16,7 @@ set -u
 
 kill_remnants() {
   # 兜底强杀。匹配串里不要出现本脚本名，否则会把自己也杀掉。
-  pkill -9 -f "gzserver|gzclient|gazebo_ros|robot_state_publisher|component_container|rviz2|spawn_entity|slam_toolbox|fastlio_mapping|pointcloud_to_laserscan|teleop_twist_keyboard|map_saver|joint_state_publisher" 2>/dev/null || true
+  pkill -9 -f "gzserver|gzclient|gazebo_ros|robot_state_publisher|component_container|rviz2|spawn_entity|slam_toolbox|rtabmap|fastlio_mapping|pointcloud_to_laserscan|teleop_twist_keyboard|map_saver|joint_state_publisher" 2>/dev/null || true
   pkill -9 -x gazebo 2>/dev/null || true
 }
 

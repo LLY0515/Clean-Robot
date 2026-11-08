@@ -15,6 +15,7 @@
 7. [导航规划（Nav2）](#7-导航规划nav2)
 8. [文件调用关系](#8-文件调用关系)
 9. [数据流通关系总图](#9-数据流通关系总图)
+10. [运行环境与性能（WSL2 / GPU）](#10-运行环境与性能wsl2--gpu)
 
 ---
 
@@ -32,14 +33,22 @@ src/
 │   │   └── sam_bot_description.urdf    # 机器人模型 + Gazebo 插件（xacro 格式）
 │   ├── launch/
 │   │   ├── navigation.launch.py        # 完整导航仿真（Gazebo + FAST-LIO + 重定位 + Nav2 + RViz）
-│   │   └── display.launch.py           # 模型显示 / 建图启动（Gazebo + RSP + FAST-LIO + RViz）
+│   │   ├── display.launch.py           # 模型显示 / 建图启动（Gazebo + RSP + FAST-LIO + RViz）
+│   │   └── rtabmap_mapping.launch.py   # build_map.sh 默认建图算法（/scan + FAST-LIO 里程计）
 │   ├── config/
 │   │   ├── nav2_params.yaml            # Nav2 全套导航参数（无 amcl 段）
-│   │   └── mapper_params_online_async.yaml  # slam_toolbox 在线建图参数
+│   │   └── mapper_params_online_async.yaml  # slam_toolbox 在线建图参数（备选算法）
 │   ├── rviz/
 │   │   └── urdf_config.rviz            # display.launch.py 用的 RViz 配置
 │   ├── world/
-│   │   └── my_world.sdf                # Gazebo 世界（围墙 + 障碍物）
+│   │   ├── my_carpark                  # 默认场景：约 20×20 m 停车场（围墙 + 隔墙/隔离墩 + 2 辆车）
+│   │   ├── my_world.sdf                # 备选：10×10 m 方围墙 + 箱子/球
+│   │   ├── my_newworld.sdf             # 备选：建模导出的楼宇（配套 model.sdf/model.config）
+│   │   └── my_carrom/                  # 备选：车辆模型场景
+│   ├── tools/
+│   │   ├── save_map.py                 # 订阅 /map 存成 pgm + yaml（build_map.sh 与自动保存用）
+│   │   ├── topic_ready.py              # 等某个话题出数据（带超时，脚本启动检查用）
+│   │   └── generate_world.py           # 生成 world 场景的辅助脚本
 │   └── map/
 │       ├── my_map.yaml                 # 2D 地图元数据（分辨率/原点）
 │       ├── my_map.pgm                  # 2D 地图栅格图像（占用网格）
@@ -47,11 +56,12 @@ src/
 ├── fast_lio/                           # FAST-LIO 里程计包
 │   └── config/
 │       ├── mid360_sim.yaml             # 导航用参数（lidar_type=4）
-│       └── mid360_sim_mapping.yaml     # 建图用参数（pcd_save_en / map_en）
+│       ├── mid360_sim_2dmap.yaml       # 2D 建图用（点云全量参与配准，精度优先）
+│       └── mid360_sim_mapping.yaml     # 3D 先验建图用（pcd_save_en / map_en）
 ├── fastlio_localization/               # 3D 点云重定位包（替代 AMCL）
 │   ├── src/relocalization_node.cpp
 │   ├── config/relocalization_params.yaml
-│   └── tools/auto_drive_map.py
+│   └── tools/auto_drive_map.py, shift_pcd.py
 └── mid360_simulation/                  # Livox Mid-360 仿真插件包
 ```
 
@@ -66,7 +76,8 @@ src/
 | `fast_lio` | LiDAR+IMU 紧耦合里程计，发布 odom→base_link |
 | `fastlio_localization` | 3D 点云重定位，发布 map→odom |
 | `nav2_bringup` / `nav2_rviz_plugins` | 导航栈与 RViz 导航插件 |
-| `slam_toolbox` | 2D 建图（`build_map.sh`，运行期不启动） |
+| `rtabmap_ros` | 2D 建图默认算法（`build_map.sh`，运行期不启动） |
+| `slam_toolbox` | 2D 建图备选算法（`SLAM_ALGO=slam_toolbox ./build_map.sh`） |
 | `tf2_ros` | TF 坐标变换 |
 
 ---
@@ -172,7 +183,10 @@ URDF 里的 `<gazebo>` 标签在机器人被 spawn 进 Gazebo 时生效，每个
 ### 3.3 激光雷达
 
 - 发布 `/livox/lidar`（`sensor_msgs/PointCloud2`，10 Hz），`frame_id: livox`，由 `libmid360_plugin.so` 按 `mid360.csv` 定义的非重复扫描轨迹生成 3D 点云，量程 0.1~15.0 m。
-- Nav2 只认 2D 激光，故 launch 里另起 `pointcloud_to_laserscan` 节点把 `/livox/lidar` 投影成 `/scan`（`LaserScan`，frame `base_link`，10 Hz，量程 0.1~15.0 m）。
+- Nav2 只认 2D 激光，故 launch 里另起 `pointcloud_to_laserscan` 节点把 `/livox/lidar` 投影成 `/scan`（`LaserScan`，frame `base_link`，10 Hz，量程 0.1~15.0 m）。投影薄片 `min_height −0.05` / `max_height 2.50`：
+  - 下限必须高于地面（地面在 `base_link` 系约 −0.24 m），否则地面环被投影成假墙；
+  - 雷达 30° 前倾时约 62% 的射线落在 15 m 内的地面上，落在薄片内的只有约 38%，360 束里有效回波 153~166 束（水平安装时可达 258~276 束）；
+  - `use_inf: false`：无回波方向填 `range_max + inf_epsilon = 16.0`，而不是 `+inf`。slam_toolbox 会自己丢掉 inf，但 RTAB-Map 把 LaserScan 转点云时会把 inf 带进去，建到几百个节点后内存爆掉（实测 ~350 节点时 OpenCV 分配 132 GB 后崩溃）。
 
 ---
 
@@ -200,6 +214,7 @@ prior_3d_map.pcd ──► fastlio_relocalization ──► TF: map→odom（10 
 |------|-----|------|
 | `common.lid_topic` / `imu_topic` | `/livox/lidar` / `/livox/imu` | 输入 |
 | `preprocess.lidar_type` | 4 | 标准 `PointCloud2` 输入（Livox 自定义格式用 1） |
+| `preprocess.scan_rate` | **1000**（仿真）/ 10（真机） | 仿真雷达每帧是"瞬时快照"，没有 100 ms 扫描过程；`mid360_handler` 却按 `Δ方位角 / (0.361 × scan_rate)` 反推每点时间，`scan_rate: 10` 会把整帧判成跨越 99.7 ms，`lidar_end_time` 比真实拍摄时刻晚 0.1 s，FAST-LIO 给 T 时刻的姿态打上 T+0.1 的戳，转向时地图被抹歪（实测偏航误差 7.3° → 0.67°） |
 | `mapping.gyr_cov` | **0.01** | 仿真陀螺几乎无噪声；默认 0.1 会让纯旋转 yaw 明显低估 |
 | `mapping.extrinsic_R` | Ry(+30°) | 雷达物理前倾 30°，IMU 水平安装，补偿这 30° |
 | `mapping.extrinsic_T` | `[0.0125, −0.0233, 0.0437]` | IMU 在雷达系中的位置（反向旋转后） |
@@ -273,22 +288,28 @@ map ──► odom ──► base_link ──► base_footprint
 
 ### 6.1 2D 建图流程（`build_map.sh`）
 
-1. 用 `display.launch.py` 启动 Gazebo + `robot_state_publisher` + FAST-LIO + RViz；
-2. 运行 `slam_toolbox`（online async 模式）订阅 `/scan` 和 TF，发布 `map → odom` 变换与 `/map` 话题；
+默认用 **RTAB-Map** 建图，`SLAM_ALGO=slam_toolbox ./build_map.sh` 可切回 slam_toolbox：
+
+1. 用 `display.launch.py` 启动 Gazebo + `robot_state_publisher` + FAST-LIO（**`mid360_sim_2dmap.yaml`**）+ `/scan` 投影，Gazebo 窗口关闭（`gui:=False`，RViz 保留）；
+2. 启动建图节点：
+   - 默认 `rtabmap_mapping.launch.py`：订阅 `/scan` 和 FAST-LIO 里程计，发布 `/map` 与 `map → odom`；
+   - 切到 slam_toolbox 时改用 online async 模式（参数 `mapper_params_online_async.yaml`）；
 3. 手动控制机器人（如 `teleop_twist_keyboard` 发 `/cmd_vel`）遍历环境；
-4. 用 `nav2_map_server` 的 `map_saver` 把 `/map` 保存成文件。
+4. 用 `tools/save_map.py` 订阅 `/map` 存成 pgm + yaml；脚本另有每 20 s 一次的后台自动保存，Ctrl+C 中断最多丢 20 s 的建图成果。
+
+> 2D 建图专用配置 `mid360_sim_2dmap.yaml` 与导航默认的 `mid360_sim.yaml` 只差点云密度四项（`point_filter_num 3→1`、`filter_size_surf 0.5→0.2`、`filter_size_map 0.5→0.2`、`max_iteration 3→4`）：仿真插件每帧只有 2500 条射线，默认配置再"每 3 点取 1 + 0.5 m 体素"后每帧只剩约 800 点，ICP 约束弱、里程计漂移大。实测方形路线 16.7 m，漂移从 0.225 m 降到 0.06~0.12 m，slam_toolbox 的修正跳变和"地图轮廓叠轮廓"重影随之减轻。
 
 ### 6.2 3D 先验点云流程（`build_3d_map.sh`）
 
 1. 用 `mid360_sim_mapping.yaml` 启动 FAST-LIO（打开 `pcd_save_en` 与 `publish.map_en`）；
 2. 用 `fastlio_localization/tools/auto_drive_map.py` 或键盘遥控遍历环境，FAST-LIO 在 `odom` 系累积点云并发布 `/Laser_map`；
 3. 调用 `/map_save` 服务，把累积点云写成 `src/sam_bot_description/map/prior_3d_map.pcd`；
-4. **平移 PCD**：`tools/shift_pcd.py` 把 x/y 加上 `(0.3335, 0.0233) m`。FAST-LIO 的 `odom` 原点是建图起点的 **IMU**，而 2D 栅格地图的原点是 **base_link**（世界原点），不平移会让 3D 重定位的 `map` 与 `map_server` 的地图错开一个 IMU 安装偏移。z 不平移（保持雷达平面为 0，与重定位的 `constrain_planar` 一致）。脚本每次先删旧 PCD 再保存，不会重复平移；
-5. PCD 的坐标系现在是建图起点的 `base_link`，也就是导航时 2D 地图的 `map` 系。
+4. **不做平移**：FAST-LIO 保存的点云在 `odom` 系，原点是建图起点的 IMU 位姿；而 slam_toolbox / RTAB-Map 建 2D 地图时 `map → odom` 初始为单位阵，2D 地图的 `map` 原点**同样是**建图起点的 IMU。两者天然对齐，再按 IMU 安装偏移平移反而会让重定位输出的 `map → odom` 多出 0.33 m（实测 `map → base_link` 从正确的 (−0.305, −0.022) 变成 (0.012, −0.016)，表现为 RViz 里没撞、Gazebo 里撞）。`tools/shift_pcd.py` 的默认平移已停用，`build_3d_map.sh` 也不再调用它，只保留手工调试用途；
+5. PCD 与 2D 栅格图共用"建图起点的 IMU"作为原点，也就是导航时的 `map` 系。
 
 > 2D 地图与 3D 先验点云必须来自**同一次起点**的建图（都在世界原点附近出发），否则 `map` 不一致。详见 [运行文档 §3.4](运行文档.md)。
 >
-> 自检：静止时 `tf2_echo map base_link` 的 x/y/yaw 应与 `gz model -m sam_bot -p` 的真值基本一致（< 0.2 m）；若差约 0.33 m，说明 PCD 是平移前的旧文件，需重建或手动跑一次 `shift_pcd.py`。
+> 自检：机器人静止、刚启动时 `tf2_echo map base_link` 应约为 **x ≈ −0.31~−0.33、y ≈ −0.02**（base_link 在建图起点 IMU 后方 0.33 m）。注意 `map` 原点是建图起点的 IMU、不是 Gazebo 世界原点，所以不能直接和 `gz model -m sam_bot -p` 的绝对值比。若 x ≈ +0.01，说明 PCD 被多余地平移过一次，需重建或手工反向平移。
 
 ### 6.3 2D 地图文件（`src/sam_bot_description/map/my_map.yaml`）
 
@@ -296,15 +317,16 @@ map ──► odom ──► base_link ──► base_footprint
 image: my_map.pgm
 mode: trinary
 resolution: 0.05          # 每像素 5 cm
-origin: [-4.91, -4.91, 0] # 地图左下角在 map 坐标系中的位置
+origin: [-13.0481, -13.2706, 0.0]  # 地图左下角在 map 坐标系中的位置
 negate: 0
 occupied_thresh: 0.65
 free_thresh: 0.25
 ```
 
-- 地图是 **198×199** 像素、0.05 m/pix，覆盖约 9.9 m × 9.95 m；
-- `origin [-4.91, -4.91]` 使地图覆盖 map 坐标系约 `[-4.91, 4.99] × [-4.91, 5.04]`，与 `my_world.sdf` 里四面墙围成的约 `[-5, 5] × [-5, 5]` 区域对齐；
-- 机器人 spawn 在 Gazebo 世界原点 (0,0)，对应 map 坐标约为 (0,0)（因为建图时也是从原点出发）。
+- 地图是 **420×426** 像素、0.05 m/pix，覆盖约 **21.0 m × 21.3 m**；
+- `origin` 使地图覆盖 map 坐标系约 `[-13.05, 7.95] × [-13.27, 8.03]`；
+- 建图场景是 `world/my_carpark`（约 20×20 m 停车场），机器人出生在世界坐标 **(2.0, 2.7)**，与 `display.launch.py` / `navigation.launch.py` 的 spawn 参数一致；
+- `map` 原点 = 建图起点的 IMU 位姿（见 §6.2），因此不是 Gazebo 世界原点，数值上不要拿世界坐标直接对照。
 
 ---
 
@@ -393,10 +415,10 @@ behavior_server(恢复行为) ────────────────�
 ```
 ros2 launch sam_bot_description navigation.launch.py
 │
-├─ IncludeLaunch(gzserver.launch.py)   ← 加载 src/sam_bot_description/world/my_world.sdf（Gazebo 世界）
-├─ IncludeLaunch(gzclient.launch.py)   ← Gazebo 图形界面
+├─ IncludeLaunch(gzserver.launch.py)   ← 加载 src/sam_bot_description/world/my_carpark（Gazebo 世界）
+├─ IncludeLaunch(gzclient.launch.py)   ← Gazebo 图形界面（gui:=false 时跳过）
 ├─ Node(robot_state_publisher)         ← 参数：xacro 展开后的 robot_description
-├─ Node(spawn_entity.py)               ← 把机器人 spawn 进 Gazebo（-topic robot_description）
+├─ Node(spawn_entity.py)               ← 把机器人 spawn 进 Gazebo（-x 2.0 -y 2.7 -z 0.24）
 ├─ Node(fastlio_mapping)               ← 参数：config/mid360_sim.yaml + use_sim_time
 ├─ Node(pointcloud_to_laserscan)       ← /livox/lidar → /scan
 ├─ IncludeLaunch(nav2 navigation_launch.py) ← 参数：params_file + use_sim_time（无 amcl）
@@ -413,7 +435,7 @@ ros2 launch sam_bot_description navigation.launch.py
 | 启动文件 | 读取的文件 | 作用 |
 |----------|-----------|------|
 | `navigation.launch.py` | `description/sam_bot_description.urdf` | 经 `Command(['xacro ', ...])` 展开成纯 URDF |
-| `navigation.launch.py` | `world/my_world.sdf` | Gazebo 世界 |
+| `navigation.launch.py` | `world/my_carpark` | Gazebo 世界（文件名无 `.sdf` 后缀，按内容解析） |
 | `navigation.launch.py` | `src/sam_bot_description/map/my_map.yaml` | 传给 map_server（经 Nav2 RewrittenYaml 改写 `yaml_filename`） |
 | `navigation.launch.py` | `src/sam_bot_description/map/prior_3d_map.pcd` | 传给 relocalization_node 的 `prior_map_path` |
 | `navigation.launch.py` | `config/nav2_params.yaml` | Nav2 全套参数 |
@@ -501,6 +523,39 @@ local_costmap ──────────────────────
 | `/aligned_scan` | PointCloud2 | fastlio_relocalization | RViz |
 | `/localization_pose` | PoseWithCovarianceStamped | fastlio_relocalization | RViz 等 |
 | `/relocalize` | std_srvs/Trigger | — | fastlio_relocalization（手动触发全局重定位） |
+
+---
+
+## 10. 运行环境与性能（WSL2 / GPU）
+
+本机是 WSL2（Ubuntu 22.04）+ WSLg，桌面 5120×1600。实测**仿真/数据链路不是瓶颈，卡顿来自 GUI 渲染**，排查结论如下。
+
+### 10.1 渲染路径
+
+- Gazebo 和 RViz 都走 Mesa 的 `d3d12` 后端（硬件加速），**不是** llvmpipe 软件渲染。`swrast_dri.so` 只是 Mesa 启动时加载的备用模块，出现在 `/proc/<pid>/maps` 里不代表在用软件渲染——以 `glGetString(GL_RENDERER)` 为准。
+- Mesa 默认选中的是 **Intel UHD 核显**（`D3D12 (Intel(R) UHD Graphics)`），RTX 5060 完全闲置。`run.sh` / `build_map.sh` / `build_3d_map.sh` 现在统一设置：
+  ```bash
+  export MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA
+  ```
+  之后 `GL_RENDERER` 变为 `D3D12 (NVIDIA GeForce RTX 5060 Laptop GPU)`；RViz 日志里的 `OpenGl version` 从 `2.1 (GLSL 1.2)` 变成 `4.2 (GLSL 4.2)`（Intel 只支持到 4.1，可用来确认选卡生效）。
+- `navigation.launch.py` 以前给 rviz2 传 `MESA_GL_VERSION_OVERRIDE=2.1`，现已移除：Mesa 默认给的是 GL 4.1 兼容模式（不是 core profile），实测 rviz2 正常；而 Map 显示器的 `indexed_8bit_image` GLSL link 错误（`active samplers with a different type refer to the same texture image unit`）在 2.1 和 4.1 下都会出现，是 RViz 的 glsl120 shader 在 Mesa 上的老问题，与该变量无关，也不影响显示。
+
+### 10.2 实测数据（GUI 全开）
+
+| 项目 | 数值 |
+|------|------|
+| 实时因子 RTF | 0.94~0.97，仿真准实时 |
+| `/clock`、`/livox/lidar`、`/scan`、`/cloud_registered` | 约 9.6~9.7 Hz，无积压 |
+| 消息时间戳滞后 | scan −0.03 s、cloud 0.07 s、两张 costmap 0.00 s |
+| CPU（24 核） | 约 3 核：gzserver ~1.3 核、gzclient ~0.7、rviz2 ~0.3、FAST-LIO ~0.33、重定位 ~0.35 |
+| 同尺寸 GL 吞吐（2258×1217，整套栈运行时） | Intel 核显 29 FPS → RTX 5060 57 FPS |
+| 代价地图发布频率（实测） | local ~1.6 Hz（配置 `publish_frequency: 2.0`）、global ~0.5 Hz（配置 `update_frequency: 1.0`，单次更新耗时超过周期） |
+
+### 10.3 还能做什么
+
+- Gazebo 的 `<gui>` 段没有 `update_rate`，gzclient 会不设上限地重绘。两个窗口各接近半屏（约 2.7 + 3.0 M 像素）时，核显很容易被占满。
+- 仍然觉得卡时：`HEADLESS=1 ./run.sh`（只开 RViz、不开 Gazebo 窗口），或把 Gazebo 窗口拉小一档。
+- WSLg 的合成/推流路径（XWayland → Weston → RDP）本身有固定开销：即使渲染已交给独显，大窗口仍要合成后送到 Windows，这是换显卡也消不掉的延迟。
 
 ---
 
