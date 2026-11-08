@@ -33,7 +33,11 @@ fastlio_relocalization:
     max_tracking_jump: 1.0            # 单帧 map->odom 平移跳变上限 (m)
     max_tracking_yaw_jump: 0.6        # 单帧偏航跳变上限 (rad)
     correction_alpha: 0.6             # 跟踪结果平滑系数，1.0 = 不平滑
-    constrain_planar: true            # 地面机器人：map->odom 只保留 x/y/yaw
+    # 地面机器人：map->odom 只保留 x/y/z 平移和 yaw（roll/pitch 归零）。
+    # z 必须保留：FAST-LIO 的 odom 高度会慢慢漂移（实测 10 分钟约 1 m），
+    # 由 map->odom 的 z 吸收；否则扫描点云在 map 系整体抬高，内点率掉到
+    # 0.3~0.4，跟踪失败、map->odom 冻结，代价地图出现幽灵障碍。
+    constrain_planar: true
 
     # ---------------- 全局搜索 ----------------
     relocalize_on_start: true
@@ -48,6 +52,18 @@ fastlio_relocalization:
     # 箱顶、球顶这些高处结构后，正方围墙里的角度歧义明显减小。
     # 设成 <= 0 可关闭该过滤（退回整张地图搜索）。
     global_search_height: 0.35
+
+    # ---------------- 全局结果验收 ----------------
+    # 内点率只统计距离 < inlier_distance 的点，单靠它挡不住误匹配：实测一次
+    # 错误解内点率 0.60（刚过 0.55 的线）、平均最近邻却有 0.487 m（正确解
+    # 0.07~0.10 m），map->odom 被拉偏 3 m，正在跑的 FollowPath 直接
+    # "Resulting plan has 0 poses" 中止。下面两道闸用于拒绝这类解。
+    max_relocalize_mean_dist: 0.30
+    # 相对搜索开始时 map->odom 的平面位移上限。正常跟踪时 map->odom 近似
+    # 不变，3 m 的跳变只可能是误匹配；只有得分 >= strict_relocalize_score
+    # 才放行（机器人被搬动后重定位的真实场景仍可恢复）。
+    max_relocalize_jump: 2.0
+    strict_relocalize_score: 0.85
 
     # ---------------- 输出 ----------------
     publish_rate: 10.0                # map->odom TF 发布频率

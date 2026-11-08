@@ -1,0 +1,204 @@
+// Copyright (c) 2023 Open Navigation LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef OPENNAV_COVERAGE__ROUTE_GENERATOR_HPP_
+#define OPENNAV_COVERAGE__ROUTE_GENERATOR_HPP_
+
+#include <vector>
+#include <string>
+#include <optional>
+
+#include "fields2cover.h" // NOLINT
+
+#include "rclcpp/rclcpp.hpp"
+#include "nav2_util/lifecycle_node.hpp"
+#include "nav2_util/node_utils.hpp"
+#include "opennav_coverage_msgs/msg/route_mode.hpp"
+#include "opennav_coverage/utils.hpp"
+#include "opennav_coverage/types.hpp"
+
+namespace opennav_coverage
+{
+
+/**
+ * @class Route mode and state
+ */
+class RouteGenerator
+{
+public:
+  /**
+   * @brief Constructor for swath mode
+   * @param node A node to get the swath type from
+   */
+  template<typename NodeT>
+  explicit RouteGenerator(const NodeT & node)
+  {
+    nav2_util::declare_parameter_if_not_declared(
+      node, "default_route_type", rclcpp::ParameterValue("BOUSTROPHEDON"));
+    std::string type_str = node->get_parameter("default_route_type").as_string();
+    default_type_ = toType(type_str);
+
+    // Global-genRoute vs per-cell-fallback threshold: raise for better routes on larger
+    // fields, lower if F2C v2.0.0's genRoute runs out of memory.
+    nav2_util::declare_parameter_if_not_declared(
+      node, "default_max_swaths_for_global_route", rclcpp::ParameterValue(300));
+    default_max_swaths_for_global_route_ =
+      node->get_parameter("default_max_swaths_for_global_route").as_int();
+
+    default_generator_ = createGenerator(default_type_);
+
+    nav2_util::declare_parameter_if_not_declared(
+      node, "default_spiral_n", rclcpp::ParameterValue(4));
+    default_spiral_n_ = node->get_parameter("default_spiral_n").as_int();
+
+    nav2_util::declare_parameter_if_not_declared(
+      node, "default_custom_order", rclcpp::PARAMETER_INTEGER_ARRAY);
+    try {
+      // Get the custom order and cast to size_t
+      auto order = node->get_parameter("default_custom_order").as_integer_array();
+      default_custom_order_ = std::vector<size_t>(order.begin(), order.end());
+    } catch (...) {
+      RCLCPP_WARN(
+        node->get_logger(),
+        "default_custom_order was not set! "
+        "If using Custom Route mode, the custom order must be set per-request!");
+    }
+
+    nav2_util::declare_parameter_if_not_declared(
+      node, "default_tsp_redirect_swaths", rclcpp::ParameterValue(true));
+    default_tsp_redirect_swaths_ =
+      node->get_parameter("default_tsp_redirect_swaths").as_bool();
+
+    nav2_util::declare_parameter_if_not_declared(
+      node, "default_tsp_time_limit", rclcpp::ParameterValue(1));
+    default_tsp_time_limit_ =
+      node->get_parameter("default_tsp_time_limit").as_int();
+
+    nav2_util::declare_parameter_if_not_declared(
+      node, "default_tsp_search_for_optimum", rclcpp::ParameterValue(false));
+    default_tsp_search_for_optimum_ =
+      node->get_parameter("default_tsp_search_for_optimum").as_bool();
+
+    nav2_util::declare_parameter_if_not_declared(
+      node, "default_tsp_d_tol", rclcpp::ParameterValue(1e-4));
+    default_tsp_d_tol_ = node->get_parameter("default_tsp_d_tol").as_double();
+  }
+
+  /**
+   * @brief Generate an ordered route for any mode (orderers or TSP).
+   * @param travel_cells Border-sharing cells inter-cell bridges may follow
+   * @param swath_cells Cells the swaths were generated from (carved corridors)
+   * @param swaths_by_cells Per-cell swaths from generateSwathsByCells
+   * @param settings Action request information
+   * @param start_end_point Optional start/end point for the route (TSP mode only)
+   * @return F2CRoute (ordered swath groups plus any connections)
+   */
+  F2CRoute generateRoute(
+    const F2CCells & travel_cells,
+    const F2CCells & swath_cells,
+    const F2CSwathsByCells & swaths_by_cells,
+    const opennav_coverage_msgs::msg::RouteMode & settings,
+    const std::optional<F2CPoint> & start_end_point = std::nullopt);
+
+  /**
+   * @brief Convenience overload when the travel and swath cells are the same
+   */
+  F2CRoute generateRoute(
+    const F2CCells & cells,
+    const F2CSwathsByCells & swaths_by_cells,
+    const opennav_coverage_msgs::msg::RouteMode & settings,
+    const std::optional<F2CPoint> & start_end = std::nullopt)
+  {
+    return generateRoute(cells, cells, swaths_by_cells, settings, start_end);
+  }
+
+  /**
+   * @brief Whether the request (or the default it falls back to) is TSP.
+   *        Used to reject non-TSP + decomposition before any geometry work.
+   * @param settings Action request information
+   * @return true when the route mode resolves to TSP
+   */
+  bool resolvesToTsp(const opennav_coverage_msgs::msg::RouteMode & settings)
+  {
+    RouteType type = toType(settings.mode);
+    if (type == RouteType::UNKNOWN) {
+      type = default_type_;
+    }
+    return type == RouteType::TSP;
+  }
+
+  /**
+   * @brief Sets the mode manually of the Route for dynamic parameters
+   * @param mode String for mode to use
+   */
+  void setMode(const std::string & new_mode);
+
+  /**
+   * @brief Sets the spiral N manually for dynamic parameters
+   * @param mode String for mode to use
+   */
+  void setSpiralN(const int & n) {default_spiral_n_ = n;}
+
+  /**
+   * @brief Sets the custom order manually for dynamic parameters
+   * @param mode String for mode to use
+   */
+  void setCustomOrder(const std::vector<long int> & order)  // NOLINT
+  {
+    default_custom_order_ = std::vector<size_t>(order.begin(), order.end());
+  }
+
+  void setTspRedirectSwaths(const bool v) {default_tsp_redirect_swaths_ = v;}
+  void setTspTimeLimit(const int v) {default_tsp_time_limit_ = v;}
+  void setTspSearchForOptimum(const bool v) {default_tsp_search_for_optimum_ = v;}
+  void setTspDTol(const double v) {default_tsp_d_tol_ = v;}
+  void setMaxSwathsForGlobalRoute(const int v) {default_max_swaths_for_global_route_ = v;}
+
+protected:
+  /**
+   * @brief Creates generator pointer of a requested type
+   * @param type Route generator type to create
+   * @return Generator to use
+   */
+  RouteGeneratorPtr createGenerator(const RouteType & type);
+
+  /**
+   * @brief Converts the route mode into a string for publication
+   * @param Type of mode
+   * @return String of mode
+   */
+  std::string toString(const RouteType & type);
+
+  /**
+   * @brief Converts the route string into a mode for handling
+   * @param String of mode
+   * @return Type of mode
+   */
+  RouteType toType(const std::string & str);
+
+  RouteType default_type_;
+  std::vector<size_t> default_custom_order_;
+  size_t default_spiral_n_;
+  RouteGeneratorPtr default_generator_{nullptr};
+  bool default_tsp_redirect_swaths_{true};
+  int default_tsp_time_limit_{1};
+  bool default_tsp_search_for_optimum_{false};
+  double default_tsp_d_tol_{1e-4};
+  int default_max_swaths_for_global_route_{300};
+  rclcpp::Logger logger_{rclcpp::get_logger("RouteGenerator")};
+};
+
+}  // namespace opennav_coverage
+
+#endif  // OPENNAV_COVERAGE__ROUTE_GENERATOR_HPP_

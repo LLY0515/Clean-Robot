@@ -24,10 +24,9 @@ bt_navigator:
       plugin: "nav2_bt_navigator::NavigateToPoseNavigator"
     navigate_through_poses:
       plugin: "nav2_bt_navigator::NavigateThroughPosesNavigator"
-    # 'default_nav_through_poses_bt_xml' and 'default_nav_to_pose_bt_xml' are use defaults:
-    # nav2_bt_navigator/navigate_to_pose_w_replanning_and_recovery.xml
-    # nav2_bt_navigator/navigate_through_poses_w_replanning_and_recovery.xml
-    # They can be set here or via a RewrittenYaml remap from a parent launch file to Nav2.
+    # 自定义 BT：去掉倒车恢复动作，并给 FollowPath 显式指定 goal_checker_id。
+    default_nav_to_pose_bt_xml: "$(find-pkg-share sam_bot_description)/behavior_trees/navigate_to_pose_w_replanning_and_recovery_no_backup.xml"
+    default_nav_through_poses_bt_xml: "$(find-pkg-share sam_bot_description)/behavior_trees/navigate_through_poses_w_replanning_and_recovery_no_backup.xml"
 
     # plugin_lib_names is used to add custom BT plugins to the executor (vector of strings).
     # Built-in plugins are added automatically
@@ -57,28 +56,55 @@ controller_server:
     min_theta_velocity_threshold: 0.001
     failure_tolerance: 0.3
     progress_checker_plugins: ["progress_checker"]
-    goal_checker_plugins: ["general_goal_checker"] # "precise_goal_checker"
+    # 【新增】coverage_goal_checker：覆盖任务逐条 swath 跟踪时要求更高的终点精度，
+    # 否则 0.25 m 的默认容差会让相邻条带出现漏扫/重叠。转场和绕行仍用宽松的
+    # general_goal_checker。
+    goal_checker_plugins: ["general_goal_checker", "coverage_goal_checker"] # "precise_goal_checker"
     controller_plugins: ["FollowPath"]
     odom_topic: /demo/odom
     use_realtime_priority: false
     enable_stamped_cmd_vel: true
 
     # Progress checker parameters
+    # 【修正】原来 0.5 m / 10 s 太严：转场终点只差 0.5 m 时，MPPI 先原地
+    # 转向（旋转不计入位移），10 s 内凑不满 0.5 m 就被判 "Failed to make
+    # progress"，BT 随即进恢复流程 Spin 1.57 rad，反而把朝向越转越偏，
+    # 形成 abort→Spin→再 abort 的死循环（实测卡住 120 s 后转场超时）。
+    # 放宽到 0.15 m / 20 s：正常慢速收敛不会误判，真卡死也能在 20 s 内发现。
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.5
-      movement_time_allowance: 10.0
+      required_movement_radius: 0.15
+      movement_time_allowance: 20.0
     # Goal checker parameters
     #precise_goal_checker:
     #  plugin: "nav2_controller::SimpleGoalChecker"
     #  xy_goal_tolerance: 0.25
     #  yaw_goal_tolerance: 0.25
     #  stateful: True
+    # 【修正】转场目标不需要精确到 0.25 m。实测 MPPI 在"距目标 0.5 m、
+    # 且需要横移/大角度修正"的终点会来回画龙，20 s 内位移不足 0.15 m，
+    # 一直被进度检查打断，转场 120 s 超时。转场只要把车带到 swath 起点
+    # 附近即可，紧接着的 FollowPath 会自动把车拉到条带直线上，因此把
+    # 转场用的 general_goal_checker 放宽到 0.6 m / 0.6 rad（与执行器的
+    # transit_tolerance 一致）。
     general_goal_checker:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.25
-      yaw_goal_tolerance: 0.25
+      xy_goal_tolerance: 0.6
+      yaw_goal_tolerance: 0.6
+    # 【新增】覆盖任务专用：条带终点需要走准，但不必反复原地调整朝向，
+    # 保持 stateful=False，避免上一条条带的到达判定影响下一条。
+    #
+    # 【修正】xy_goal_tolerance 0.05 -> 0.12：条带终点离东侧墙只有 0.55 m
+    # （多边形内缩）再减 swath_end_trim 0.25 m，MPPI 在膨胀层附近很难精确
+    # 压进 5 cm，实测每条 swath 都在终点停在 0.07~0.10 m 处不动，5 s 后被
+    # 执行器的“进度停滞”兜底当成绕行处理——多花 5 s 且发出一次假的
+    # blocked_interval。0.12 m 仍远小于 0.8 m 的条带间距，不会造成漏扫。
+    coverage_goal_checker:
+      stateful: False
+      plugin: "nav2_controller::SimpleGoalChecker"
+      xy_goal_tolerance: 0.12
+      yaw_goal_tolerance: 0.10
     FollowPath:
       plugin: "nav2_mppi_controller::MPPIController"
       time_steps: 56
@@ -88,9 +114,20 @@ controller_server:
       ax_min: -3.0
       ay_max: 3.0
       az_max: 3.5
-      vx_std: 0.2
+      # 【关键调参】U 形掉头太慢的根因在 MPPI 的采样噪声，而不是底盘或代价地图。
+      # MPPI 每次迭代围绕“当前最优控制序列”叠加白噪声采样 2000 条轨迹，最后按
+      # softmax 加权平均得到指令。半径 0.4 m 的半圆要求持续 vx≈0.5、wz≈1.25，
+      # 而原参数 vx_std=0.2、wz_std=0.4 意味着这两个值分别是 2.5σ / 3.1σ——
+      # 单条轨迹要在 56 个时间步上每步都抽到这么大的同向噪声，概率几乎为 0，
+      # 采样集中根本没有“能跟住半圆”的轨迹；同时 PathAlignCritic 对横向偏差
+      # 惩罚很重（权重 14），停在弧线起点横向偏差为 0，于是 softmax 平均退化成
+      # “原地极慢转”（实测 nav_v≈0、nav_w≈0.10 rad/s，10~16 s 才蹭过 1.26 m）。
+      # 放大采样标准差后，半圆轨迹进入采样集，掉头从 16 s 降到约 4 s
+      # （弧段均速 0.078 -> 0.31 m/s）。实测直线段横向偏差 rms 仅 1 cm，不影响
+      # 条带跟踪精度；PathAlign/PathFollow 权重调整无效，故保持原值。
+      vx_std: 0.4
       vy_std: 0.2
-      wz_std: 0.4
+      wz_std: 0.8
       vx_max: 0.5
       vx_min: -0.35
       vy_max: 0.5
@@ -174,6 +211,14 @@ local_costmap:
       use_sim_time: True
       update_frequency: 5.0
       publish_frequency: 2.0
+      # 【新增】FAST-LIO 的 odom->base_link 用雷达帧时间打时间戳，但要等该帧
+      # 处理完才发出去，实测比仿真时钟落后 0.3~0.6 s。nav2 的 ObstacleLayer 把
+      # 这个值当作 tf2 MessageFilter 的缓存时长：默认 0.3 s 时，时间戳≈当前
+      # 时刻的 /scan 等不到迟到的 TF，就被判 "the timestamp on the message is
+      # earlier than all the data in the transform cache" 整条丢掉 —— 局部图
+      # 收不到任何激光点，障碍物自然检测不到。放宽到 1.0 s 让 /scan 能等到
+      # 迟到的 TF（代价只是 TF 缺失时最多多等 1 s）。
+      transform_tolerance: 1.0
       global_frame: odom
       robot_base_frame: base_link
       rolling_window: true
@@ -244,16 +289,31 @@ local_costmap:
           obstacle_max_range: 10.0
           obstacle_min_range: 0.0
         cloud:
-          topic: /cloud_registered
+          # 【修正】用 body 系点云 /cloud_registered_body（FAST-LIO 的 IMU 体系）。
+          # 为什么不用 /cloud_registered（frame=odom）：nav2 标记和射线清除时把
+          # "点云所在坐标系的原点"当作传感器原点，odom 原点是 FAST-LIO 的起始
+          # 位姿；车一开出去就落在 4×4 m 滚动窗口外，整条观测被 continue 掉
+          # （日志刷 "Sensor origin at (0.00, 0.00) is out of map bounds ...
+          # cannot raytrace"），局部图彻底失明。body 系的传感器原点就是机器人
+          # 自己，永远在窗口中心。
+          #
+          # 【配套修正】FAST-LIO 之前把这条点云的 frame_id 写成 base_link，
+          # 但它实际是 IMU 体系（laserMapping.cpp publish_frame_body 里用
+          # RGBpointBodyLidarToIMU 转的）。URDF 里 IMU 比 base_link 高 0.89 m，
+          # nav2 会用 odom<-base_link（z≈-0.96）而不是 odom<-livox_imu（z≈-0.07）
+          # 去变换，整帧点云被压低 0.89 m，真实障碍全部落到下面的高度带之外被
+          # 滤掉 —— 这就是"拖进来的障碍物检测不到、直接撞上去"的直接原因。
+          # 已把 laserMapping.cpp 里的 frame_id 改回 livox_imu，此处才成立。
+          #
+          # 【重要】高度过滤用的是**代价地图全局坐标系**（这里是 odom），不是
+          # 点云自己的坐标系：nav2 的 ObservationBuffer 先把点云变换到
+          # global_frame 再按 z 过滤。odom 系里地面 z≈-1.15（雷达离地 1.15 m），
+          # 障碍物都在 -0.9 以上。下限 -0.85 滤掉地面并给 FAST-LIO 的高度漂移
+          # 留 0.3 m 余量，上限 2.0 覆盖 1.4 m 高的箱子和墙面。
+          topic: /cloud_registered_body
           data_type: "PointCloud2"
-          # 标记和清除都打开：点云比 /scan 密，一起标记能补上 2D 投影漏掉的
-          # 障碍物；同时它自己的标记和清除互相自洽，不会出现“刚标上就被
-          # 同一次更新清掉”的情况。
           marking: True
           clearing: True
-          # 地面点在 odom 系 z ≈ -1.14，base_link 在 -0.97，障碍物都在
-          # -0.9 以上。下限取 -0.85 把地面滤掉（否则整片地面会被标成障碍），
-          # 留 0.3 m 余量吸收 FAST-LIO 的高度漂移。
           min_obstacle_height: -0.85
           max_obstacle_height: 2.0
           # 局部窗口只有 4×4 m，6 m 足够覆盖；再远只会白白扫栅格。
@@ -272,6 +332,10 @@ global_costmap:
       use_sim_time: True
       update_frequency: 1.0
       publish_frequency: 1.0
+      # 【新增】同 local_costmap：FAST-LIO 的 odom->base_link 比雷达时间戳晚
+      # 0.3~0.6 s 才发出，默认 0.3 s 的 MessageFilter 缓存会把 /scan 全丢掉。
+      # 全局图的 cloud 源（/cloud_registered，odom 系）不受影响，但 scan 源需要。
+      transform_tolerance: 1.0
       global_frame: map
       robot_base_frame: base_link
       # 【改动】与 local_costmap 保持同一矩形轮廓（机器人不是圆形，用 robot_radius 会
@@ -315,9 +379,14 @@ global_costmap:
           obstacle_max_range: 15.0
           obstacle_min_range: 0.0
         cloud:
-          # FAST-LIO 配准后的稠密世界点云（odom 系，10 Hz，约 1 千点/帧）。
-          # 只做清除：把障碍物拖走后残留的障碍栅格连同膨胀包络一起扫掉。
-          topic: /cloud_registered
+          # 【修正】改用 /cloud_registered_body（livox_imu 系）而不是
+          # /cloud_registered（odom 系）。两者点数完全相同，但 nav2 把"点云
+          # 坐标系的原点"当传感器原点做射线清除：odom 原点是 FAST-LIO 的起始
+          # 位姿，离车越远，清除射线就越是从一个错误的位置发散出去，会把沿途
+          # 的真实障碍（墙）一起清掉。livox_imu 的原点就是车上的雷达，射线
+          # 方向才是对的。map 系 z 原点与 odom 系几乎重合（map<-odom 平移
+          # ≈(0,0,0.02)），所以下面的高度带不用改。
+          topic: /cloud_registered_body
           data_type: "PointCloud2"
           marking: True
           clearing: True

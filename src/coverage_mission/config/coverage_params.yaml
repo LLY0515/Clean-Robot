@@ -1,0 +1,188 @@
+# 全覆盖清扫任务参数
+#
+# coverage_server  : opennav_coverage 的 Coverage Server（Fields2Cover 规划）
+# coverage_executor: 本包的任务执行器（转场 / 逐条 swath / 避障回轨）
+
+coverage_server:
+  ros__parameters:
+    use_sim_time: true
+    # 车体尺寸（与 nav2_params.yaml 的 footprint 一致：1.09 x 0.76 m）
+    robot_width: 0.76
+    # 洗地盘宽度 = 相邻 swath 间距
+    operation_width: 0.8
+    min_turning_radius: 0.35
+    linear_curv_change: 200.0
+    coordinates_in_cartesian_frame: true
+    action_server_result_timeout: 10.0
+
+    # 规划阶段默认值（goal 里也会显式填写，修改这里可影响其它客户端）
+    default_allow_overlap: false
+    default_generate_decomp: true
+    default_decomp_type: "BOUSTROPHEDON"
+    default_decomp_split_angle: 0.0
+    default_headland_type: "CONSTANT"
+    default_headland_width: 0.8
+    default_swath_type: "LENGTH"
+    default_swath_angle_type: "SET_ANGLE"
+    default_swath_angle: 0.0
+    default_step_angle: 0.0174533
+    default_route_type: "TSP"
+    default_path_type: "DUBIN"
+    default_path_continuity_type: "CONTINUOUS"
+    default_turn_point_distance: 0.1
+
+    # TSP 排序（OR-Tools）。车库里条带数可能超过 300，放宽上限并给一点求解时间。
+    default_tsp_redirect_swaths: true
+    default_tsp_time_limit: 5
+    default_tsp_search_for_optimum: false
+    default_tsp_d_tol: 0.0001
+    default_max_swaths_for_global_route: 1000
+
+coverage_executor:
+  ros__parameters:
+    use_sim_time: true
+    # 空字符串 = 使用安装目录下 config/coverage_area.yaml
+    area_file: ""
+    # 与 navigation.launch.py coverage:=true 一起使用时自动开始；
+    # 手动触发可设 false，然后调用 /coverage/start (std_srvs/Trigger)
+    auto_start: true
+    frame_id: map
+    base_frame: base_link
+
+    # 转场
+    # 小于 0.6 m 的转场直接跳过 NavigateToPose，交给接下来的 FollowPath
+    # 顺带走过去。0.3 m 时经常出现"离 swath 起点只剩 0.5 m"还要发一次
+    # NavigateToPose 的情况，而 MPPI 在小距离+大角度修正时最容易触发
+    # 进度检查失败，白白浪费 120 s 超时。
+    transit_tolerance: 0.6
+    coverage_goal_checker: coverage_goal_checker
+
+    # 平滑转场：调用 planner_server 的 compute_path_to_pose 规划"到条带
+    # 起点"的路径，把条带拼在路径末尾，只发一条 follow_path。机器人沿
+    # 切线并入条带，不再"到点后原地转向、再起步"。
+    # 规划失败/超时会自动回退到 NavigateToPose（带 Nav2 恢复行为）。
+    smooth_transit: true
+    plan_timeout: 10.0
+    # 离条带直线横向多近才做前视障碍/停滞检查（转场段不检查，避免把
+    # 转场路径旁的柱子误判成当前条带被挡）。
+    on_line_tolerance: 1.0
+
+    # 弧形换轨（优先于点到点规划）：以当前车头和下一条带方向为起终切向，
+    # 正常掉头用真正的半圆（半径 = 半个车道间距），终点与起点同一纵向
+    # 坐标、不硬拉去贴墙；其余转场用三次贝塞尔半椭圆。机器人直接跟踪
+    # 弧线+条带，不需要先停再原地转向。弧线只用致命障碍栅格 + 车体半宽
+    # 校验，不通过则回退规划器。曲线完全由条带几何生成，与具体地图无关。
+    arc_connector: true
+    # 超过该距离的转场（TSP 跨区跳跃）仍交给规划器
+    arc_connector_max_length: 3.0
+    arc_lethal_threshold: 100
+    arc_clearance: 0.35
+    # U 形换轨提前量：条带末端提前 0.5×横向间距（上限 0.6 m）结束跟踪，
+    # 让机器人"尽早转弯"，换轨弧顶不会越过条带端头顶进障碍物膨胀层。
+    # 纵向已错开（跨孔洞/斜向）时自动不提前，避免漏扫。
+    turn_inset_ratio: 0.5
+    turn_inset_max: 0.6
+
+    # 障碍密集区跳扫（孔洞之外的噪声/堆放物）：
+    #   剩余条带被挡比例 >= dense_swath_ratio -> 整段放弃，换下一条 swath
+    #   近处连续障碍群长度 >= dense_cluster_length -> 跳到障碍群之后的
+    #   干净段继续扫（scan_ahead = 只检查前方多少米）
+    dense_obstacle_skip: true
+    dense_swath_ratio: 0.5
+    dense_cluster_length: 2.0
+    dense_scan_ahead: 6.0
+
+    # 执行/监控频率
+    monitor_rate: 10.0
+
+    # 障碍检查：沿当前 swath 前视 3 m。
+    # corridor_half_width 只取 0.25 m：区域多边形本身已离墙 0.55 m，
+    # 走廊再宽就会把"路边的墙"误判成障碍，导致每条靠墙 swath 都触发绕行。
+    # 凸出轨道 0.25 m 以上的障碍才需要整条轨道绕行，更小的由 MPPI 自行避让。
+    lookahead: 3.0
+    corridor_half_width: 0.25
+    footprint_radius: 0.30
+    # 代价地图发布为 OccupancyGrid（0..100，100=致命障碍，99=内接膨胀）：
+    # 只把 100 当作障碍，避免膨胀层在靠墙处误报。
+    lethal_cost_threshold: 100
+    # 障碍物之后需要连续 1.4 m 干净走廊，回轨点再往后 1.3 m。
+    # 【修正】1.0 -> 1.3：2D 代价地图只能看到障碍物朝向机器人一侧的表面，
+    # 回轨点是从"表面之后"算的；车身后半段长 0.54 m，若障碍物本身有 0.5 m
+    # 厚，1.0 m 余量只比车身长出 0.5 m，回轨瞬间车尾会蹭到障碍物（实测
+    # 0.5x0.9x1.5 m 的箱子，回轨点距箱体远侧只剩 0.13 m）。1.3 m 对
+    # 0.8 m 以内的常见车库障碍物都能留出安全余量，多跳过的 0.3 m 比撞上
+    # 再重试的代价小得多。
+    clear_run: 1.4
+    rejoin_margin: 1.3
+    max_detours_per_swath: 3
+
+    # 进度监控（代价地图看不到的卡死/阻挡）
+    stall_distance: 0.1
+    stall_yaw_delta: 0.15
+    stall_time: 5.0
+    # 停滞/失败点距条带终点小于该值时直接结束该段，不再绕行回轨。
+    # 条带终点离墙约 0.3 m，MPPI 在膨胀层附近压不进 0.12 m 的终点容差，
+    # 实测会在段末反复"停滞 -> 回轨到同一点"，每次白耗几十秒。
+    end_stall_tolerance: 1.0
+
+    # 超时
+    nav_timeout: 120.0
+    follow_timeout: 180.0
+    return_to_start: false
+
+    # 每条 swath 两端各缩短 0.25 m：
+    # 多边形边界已离墙 0.55 m，而车体前端伸出 0.545 m，不缩短会顶墙；
+    # 短于 min_swath_length 的碎片 swath 直接丢弃。
+    swath_end_trim: 0.25
+    min_swath_length: 0.40
+
+    # 规划时忽略区域里的孔洞（柱子/结构物凸包）。
+    # 【关键】Fields2Cover 对"带孔洞的多边形"会按子区域分别生成条带、各块
+    # 锚点不同：实测同一片场地出现 0.1~0.5 m 的重复行和 0.2~1.0 m 的漏扫行，
+    # 条带总长 273 m 但栅格化覆盖率只有 81%（核心区 85%）。
+    # 去掉孔洞后是整场统一的 0.8 m 网格：23 条直条带，覆盖率 94%（核心区
+    # 98%）。穿过柱子的条带由下面的 clip_swaths_at_holes 在执行前断开，
+    # 临时出现的障碍物仍由执行期的前视障碍检查绕行再回轨。
+    plan_ignore_holes: true
+
+    # 执行前按孔洞把 swath 断开（plan_ignore_holes 的配套）。
+    # 规划忽略孔洞得到整场统一网格后，条带会直接穿过柱子/结构物；执行时在
+    # 孔洞边界外 hole_clearance 处断开、逐段执行（段内 FollowPath，段间
+    # NavigateToPose 绕过去），比"开到跟前再临时绕行"稳定得多。
+    # 区域多边形已让孔洞比真实障碍物外扩约 0.55 m，再加 0.15 m，车头
+    # （前伸 0.545 m）停在断点处仍有约 0.15 m 余量。
+    # 【实测】run10 第 12 条 swath 直接穿过西北角噪声/障碍密集区，MPPI
+    # 无可行轨迹、FAST-LIO 随后发散把位姿飘到几十米外，任务终止。
+    # 裁剪后该区域整段跳过（本图 23 条 -> 37 段，总长 326.8 -> 282.3 m）。
+    clip_swaths_at_holes: true
+    hole_clearance: 0.15
+
+    # 定位跳变保护：相邻 tick 位姿跳变超过 pose_jump_limit，或跑出所有
+    # 分区包围盒外 pose_sanity_margin 米，就取消当前 goal 并终止任务。
+    # 宁可停车重定位，也不能用发散位姿盲开。
+    pose_jump_limit: 5.0
+    pose_sanity_margin: 5.0
+
+    # 透传给 ComputeCoveragePath 的规划参数
+    #
+    # 不使用分解与地头（headland）：
+    #   - 该版 Coverage Server 的 headland 阶段只把边界向内收缩后生成
+    #     内部 swath，并不会生成沿边界的地头 swath，开启后反而漏扫整圈；
+    #   - 区域多边形已按车体尺寸内缩，直接在其上生成 swath 即可全覆盖；
+    #   - 实测 BOUSTROPHEDON 分解对本场地结果与不分解完全一致（同样 34 条），
+    #     不分解时 TSP 直接对 20~40 条 swath 排序，结果更简单、更稳定。
+    # 执行器也不请求 generate_path：DUBIN 生成的连接段会被标记成
+    # HL_SWATH，混进 swaths 列表后会变成跨越车间的斜线；逐条 swath
+    # FollowPath + NavigateToPose 转场更适合避障回轨。
+    generate_decomp: false
+    decomp_type: BOUSTROPHEDON
+    decomp_split_angle: 0.0
+    generate_headland: false
+    headland_width: 0.8
+    swath_objective: LENGTH
+    swath_mode: SET_ANGLE
+    swath_angle: 0.0
+    route_mode: TSP
+    path_type: DUBIN
+    path_continuity: CONTINUOUS
+    turn_point_distance: 0.1

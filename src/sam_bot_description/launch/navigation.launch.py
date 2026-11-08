@@ -3,7 +3,7 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (IncludeLaunchDescription, DeclareLaunchArgument,
                             TimerAction)
-from launch.conditions import IfCondition
+from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, Command
 from launch_ros.actions import Node
@@ -16,6 +16,7 @@ def generate_launch_description():
     pkg_nav2_bringup = get_package_share_directory('nav2_bringup')
     pkg_fast_lio_share = get_package_share_directory('fast_lio')
     pkg_fastlio_localization = get_package_share_directory('fastlio_localization')
+    pkg_coverage_mission = get_package_share_directory('coverage_mission')
 
     # ================= 2. 定义文件路径 =================
     # 你的 URDF 模型路径 (安装后位于 share/<pkg>/description/ 下)
@@ -215,16 +216,43 @@ def generate_launch_description():
         }],
     )
 
-    # (6) 启动 RViz2 并加载默认导航配置
+    # (5.4) 【新增】全覆盖清扫任务：coverage:=true 时启动
+    #   - opennav_coverage 的 Coverage Server（compute_coverage_path action）
+    #   - coverage_mission/coverage_executor（转场 + 逐条 swath + 避障回轨）
+    #   coverage_server 由独立的 lifecycle_manager 管理，不影响 Nav2 现有生命周期。
+    #   默认关闭，保持原有 ./run.sh 行为不变。
+    coverage_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(pkg_coverage_mission, 'launch', 'coverage.launch.py')
+        ),
+        condition=IfCondition(LaunchConfiguration('coverage', default='false')),
+        launch_arguments={'use_sim_time': use_sim_time}.items(),
+    )
+
+    # (6) 启动 RViz2 并加载配置
+    # coverage:=true 时用本包的 coverage_view.rviz：在默认导航显示之外，还预置了
+    # 全覆盖路径（/coverage/planned_path，latched）、当前条带（/coverage/current_swath）、
+    # 被挡区间与回轨点，并且视角默认俯视整场。
+    rviz_coverage_config = os.path.join(pkg_share, 'rviz', 'coverage_view.rviz')
     rviz2 = Node(
         package='rviz2',
         executable='rviz2',
         name='rviz2',
         arguments=['-d', rviz_config_file],
         parameters=[{'use_sim_time': use_sim_time}],
+        condition=UnlessCondition(LaunchConfiguration('coverage', default='false')),
         # 【改动】去掉原来的 MESA_GL_VERSION_OVERRIDE=2.1：Mesa 默认给的是 GL 4.1
         # 兼容模式（不是 core profile），实测 rviz2 跑 GL 4.1 正常；而 Map 显示器的
         # "indexed_8bit_image" GLSL link 错误在 2.1 和 4.1 下都会出现，跟这个变量无关。
+        output='screen'
+    )
+    rviz2_coverage = Node(
+        package='rviz2',
+        executable='rviz2',
+        name='rviz2',
+        arguments=['-d', rviz_coverage_config],
+        parameters=[{'use_sim_time': use_sim_time}],
+        condition=IfCondition(LaunchConfiguration('coverage', default='false')),
         output='screen'
     )
 
@@ -240,6 +268,11 @@ def generate_launch_description():
             default_value='true',
             description='Open Gazebo GUI (gzclient); false = headless'
         ),
+        DeclareLaunchArgument(
+            'coverage',
+            default_value='false',
+            description='启动全覆盖清扫任务（coverage_server + coverage_executor）'
+        ),
         gzserver,
         gzclient,
         robot_state_publisher,
@@ -250,5 +283,7 @@ def generate_launch_description():
         map_server,
         lifecycle_manager_localization,
         relocalization_node,
-        rviz2
+        coverage_launch,
+        rviz2,
+        rviz2_coverage
     ])

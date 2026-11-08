@@ -10,7 +10,7 @@ cd "$(dirname "$0")"
 #   会和 Nav2 的 map_server 同时往 /map 发数据，表现为"导航时地图还在边开边长"，
 #   看起来像还在建图。
 echo "清理残留进程..."
-pkill -9 -f "gzserver|gzclient|gazebo|robot_state_publisher|component_container|rviz2|joint_state_publisher|spawn_entity|slam_toolbox|rtabmap|fastlio_mapping|relocalization_node|pointcloud_to_laserscan|teleop_twist_keyboard|map_saver|ros2 launch sam_bot_description|nav2_map_server|nav2_lifecycle_manager|nav2_planner|nav2_controller|nav2_bt_navigator|nav2_behaviors|nav2_smoother|nav2_velocity_smoother|nav2_waypoint_follower" 2>/dev/null || true
+pkill -9 -f "gzserver|gzclient|gazebo|robot_state_publisher|component_container|rviz2|joint_state_publisher|spawn_entity|slam_toolbox|rtabmap|fastlio_mapping|relocalization_node|pointcloud_to_laserscan|teleop_twist_keyboard|map_saver|ros2 launch sam_bot_description|opennav_coverage|coverage_executor|nav2_map_server|nav2_lifecycle_manager|nav2_planner|nav2_controller|nav2_bt_navigator|nav2_behaviors|nav2_smoother|nav2_velocity_smoother|nav2_waypoint_follower" 2>/dev/null || true
 sleep 2
 
 # source 环境

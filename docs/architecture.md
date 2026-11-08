@@ -204,6 +204,12 @@ prior_3d_map.pcd ──► fastlio_relocalization ──► TF: map→odom（10 
 - **里程计层**（`fast_lio`）：LiDAR+IMU 紧耦合 iEKF，输出高频、低漂移的 `odom→base_link`；
 - **全局定位层**（`fastlio_localization`）：把实时点云与先验 PCD 做 ICP，求 `map→odom`。
 
+> 除 `/cloud_registered` 外 FAST-LIO 还发 `/cloud_registered_body`，那是
+> **IMU 体系**（`livox_imu`）的点云，两张代价地图的障碍层都用它（传感器原点
+> 就是车上的雷达，见 7.2）。`header.frame_id` 必须是 `livox_imu`——早先误标成
+> `base_link`，nav2 会按 `body_to_base_T` 的 z（0.8863 m）把整帧点云再压低一次，
+> 障碍全部掉出高度带，详见《运行文档》6.13 第 3 条。
+
 ### 4.1 为什么用 FAST-LIO 替代轮式里程计 + EKF
 
 `diff_drive` 只输出轮式里程计，长时间会漂移且没有绝对航向参考。原方案用 EKF 融合 IMU 的 yaw 只能部分缓解；FAST-LIO 直接对 LiDAR 点云做**帧到地图的迭代误差状态卡尔曼滤波**，在纯旋转、打滑时也比轮式里程计稳，同时给出 3D 点云地图。AMCL 依赖稀疏的 2D `/scan` 与栅格地图，在正方围墙 + 少量障碍物的世界里角度歧义明显；改用 3D 点云重定位后不再需要人工给初始位姿。
@@ -228,12 +234,17 @@ prior_3d_map.pcd ──► fastlio_relocalization ──► TF: map→odom（10 
 节点是纯 C++（PCL），核心流程：
 
 1. **加载先验地图**：`pcl::io::loadPCDFile` 读入 `prior_3d_map.pcd`（`PointXYZI`），体素下采样到 0.15 m；同时预计算地图的最高点 `map_max_.z`，并提取 `z >= map_max_.z - global_search_height` 的**上部结构子图**（本项目 0.35 m：墙顶、箱顶、球顶），供全局搜索评分用。
-2. **全局搜索**（启动时或 `/relocalize`）：在 (x, y, yaw) 三维栅格上以 0.5 m / 15° 步长枚举候选，用**上部结构**的点云做快速内点率评分，取 `global_search_top_k`（8）个候选。
-3. **ICP 精配准**：对每个候选用完整实时帧做 `pcl::IterativeClosestPoint`（对应距离 1.5 m），再用上部结构重新评分排序；内点率低于 `min_inlier_ratio`（0.55）判为失败。若第二候选分数 ≥ 最优的 90% 且位姿不同，打印**歧义告警**。
-4. **逐帧跟踪**：以上一帧 `map→odom` 为初值做 ICP（对应距离 0.7 m），内点率达标且相对上一帧的平移 < 1.0 m、yaw < 0.6 rad 才接受；结果按 `correction_alpha`（0.6）平滑。
-5. **失败恢复**：连续 5 帧失败自动重新触发全局搜索。
-6. **平面约束**：地面机器人只保留 x/y/yaw（`constrain_planar`）。
-7. **输出**：10 Hz 发布 `map→odom`（时间戳 `now + 0.2 s`）、`/localization_pose`、`/aligned_scan`（配准后的点云）；`/prior_map` 以 transient_local QoS 发布先验地图；`/relocalize`（`std_srvs/Trigger`）可手动触发。
+2. **z 初值估计**：FAST-LIO 的 odom 高度会漂移（实测可达 2 m 级），过期的 `map→odom` z 会让 ICP 在 z 方向直接跟丢。节点用**点云 z 分布中位数之差**估计 `map→odom` 的 z；该估计与场地/视角有关，有 0.3~0.6 m 的系统偏差，因此用成功跟踪帧上的真实对齐结果做 EMA 校准（`z_median_bias_`）。
+3. **全局搜索**（启动时或 `/relocalize`）：在 (x, y, yaw) 三维栅格上以 0.5 m / 15° 步长枚举候选，用**上部结构**的点云做快速内点率评分，取 `global_search_top_k`（8）个候选；z 用上一步的估计值做初值。
+4. **ICP 精配准**：对每个候选用完整实时帧做 `pcl::IterativeClosestPoint`（对应距离 1.5 m），再用上部结构重新评分排序。若第二候选分数 ≥ 最优的 90% 且位姿不同，打印**歧义告警**。
+5. **结果验收**（三道闸，任一不满足都保持旧 `map→odom` 并重试）：
+   - 内点率 ≥ `min_inlier_ratio`（0.55）；
+   - 平均最近邻距离 ≤ `max_relocalize_mean_dist`（0.30 m）——只靠内点率挡不住“大片点近似贴墙、平均距离 0.49 m”的误匹配，实测这种解会把 `map→odom` 拉偏 3 m；
+   - 相对搜索开始时 `map→odom` 的**平面**位移 ≤ `max_relocalize_jump`（2.0 m），除非内点率 ≥ `strict_relocalize_score`（0.85）——兼顾“机器人被搬动后重新定位”。
+6. **逐帧跟踪**：以上一帧 `map→odom`（z 初值按第 2 步修正）做 ICP（对应距离 0.7 m），内点率达标且相对上一帧的**平面**平移 < 1.0 m、yaw < 0.6 rad 才接受；结果按 `correction_alpha`（0.6）平滑。z 初值被修正过时，还会用**原始初值**再跑一次 ICP，取评分更高的结果（双初值取优）——中位数估计有抖动，双初值保证修正只会帮忙、不会帮倒忙。
+7. **失败恢复**：连续 5 帧失败自动重新触发全局搜索。
+8. **平面约束**：地面机器人只保留 x/y/z 平移和 yaw（`constrain_planar`，roll/pitch 归零）。z 必须保留：FAST-LIO 的高度漂移靠它吸收；Nav2 的 2D 代价地图与覆盖规划只看 x/y/yaw，z 平移没有副作用。
+9. **输出**：10 Hz 发布 `map→odom`（时间戳 `now + 0.2 s`）、`/localization_pose`、`/aligned_scan`（配准后的点云）；`/prior_map` 以 transient_local QoS 发布先验地图；`/relocalize`（`std_srvs/Trigger`）可手动触发。
 
 > 启动时先发布单位阵 `map→odom`，保证 Nav2 生命周期管理阶段 TF 链完整。
 
@@ -358,18 +369,46 @@ free_thresh: 0.25
 | `global_costmap` | 全局 | `map` | 1 Hz | static_layer + obstacle_layer + inflation_layer |
 | `local_costmap` | 局部（滚动） | `odom` | 5 Hz | obstacle_layer + inflation_layer |
 
-- 两者都用**两个观测源**：`/scan`（`LaserScan`）+ `/cloud_registered`
-  （FAST-LIO 配准后的 `PointCloud2`，odom 系、约 10 Hz），`marking`/`clearing`
-  都打开：
+- 两者都用**两个观测源**：`/scan`（`LaserScan`）+ 一路 FAST-LIO 配准点云
+  （`PointCloud2`，约 10 Hz），`marking`/`clearing` 都打开：
   - `/scan` 由 `/livox/lidar` 投影而来，已经把地面按高度滤掉，标记可靠；
-  - `/cloud_registered` 每帧上千点、覆盖整个前方，作为**稠密清除射线**。
+  - 点云源每帧上千点、覆盖整个前方，作为**稠密清除射线**。
     只用 `/scan` 时，30° 前倾使 360 束里只剩 120 多束有效回波，障碍物拖走后
     没有任何射线穿过的栅格永远清不掉 —— 这正是"障碍物移开了、代价地图上的
     障碍包络却一直留着"的原因。加上点云源后实测 4~6 s 内包络连同膨胀全部消失。
-  - 点云源用 `min_obstacle_height: -0.85` 把地面（odom 系 z ≈ -1.14）滤掉，
-    否则整片地面会被标成障碍；
+  - **两张图都用 `/cloud_registered_body`（`livox_imu` 系点云，FAST-LIO 的
+    IMU 体系）**。nav2 做标记和射线清除时把**点云所在坐标系的原点**当作
+    传感器原点：`/cloud_registered` 的 frame 是 `odom`，原点是 FAST-LIO 的
+    起始位姿，车一开出去就落在 4×4 m 滚动窗口外，整条观测被 `continue`
+    跳过（日志刷 `Sensor origin at (0.00, 0.00) is out of map bounds`），
+    局部图彻底失明；全局图虽然原点在 map 内，但清除射线会从一个错误的位置
+    发散，把沿途的真实墙一起清掉。`livox_imu` 的原点就是车上的雷达，
+    标记/清除都正确。
+  - **`/cloud_registered_body` 的 frame 必须是 `livox_imu`，不能是
+    `base_link`**：FAST-LIO 的 `publish_frame_body` 用
+    `RGBpointBodyLidarToIMU` 把点转到了 IMU 系，早先后缀被错标成
+    `base_link`。URDF 里 IMU 比 `base_link` 高 0.89 m，nav2 于是用
+    `odom←base_link`（z ≈ -0.96）而不是 `odom←livox_imu`（z ≈ -0.07）去
+    变换，整帧点云被压低 0.89 m，地面从 -1.15 变成 -2.04、1 m 高的箱子
+    从 `[-1.15,-0.15]` 变成 `[-2.04,-1.04]`，全部落进
+    `min_obstacle_height: -0.85` 以下被静默丢掉 —— 表现就是"拖进来的
+    障碍物检测不到、直接撞上去"。已在 `laserMapping.cpp` 里改回
+    `livox_imu`，变换后的点云与 `/cloud_registered` 完全重合。
+  - 点云源用 `min_obstacle_height: -0.85` 把地面（odom/map 系 z ≈ -1.15）
+    滤掉，否则整片地面会被标成障碍；上限 2.0 m 覆盖箱子和墙。
+    注意 nav2 的 `ObservationBuffer` 是**先把点云变换到代价地图的
+    `global_frame`、再按 z 过滤**，所以这个高度带永远是"odom/map 系"的
+    数值，不是点云自己坐标系里的数值。
   - 清除射程局部图取 6 m（窗口只有 4×4 m）、全局图也取 6 m：全局图 21×21 m，
     若整幅扫描，单次更新会超过 `update_frequency` 周期，缓冲区越积越多。
+- 两张图的 `transform_tolerance` 都设成 **1.0 s**（默认 0.3）：
+  FAST-LIO 的 `odom→base_link` 用雷达帧时间打时间戳，但要等该帧处理完才
+  发出去，实测比仿真时钟晚 0.3~0.6 s。nav2 的 `ObstacleLayer` 把这个值当作
+  `tf2_ros::MessageFilter` 的缓存时长，默认 0.3 s 时时间戳≈当前时刻的
+  `/scan` 等不到迟到的 TF，被判
+  `the timestamp on the message is earlier than all the data in the transform cache`
+  后整条丢掉（实测 10 分钟丢 200+ 条），局部图收不到任何激光点。改 1.0 s
+  后丢弃条数降到 0。
 - 全局代价地图叠加了 `/map` 静态地图，用于全局规划；
 - 局部代价地图只保留机器人周围 4×4 m 的滚动窗口，用于局部避障；
 - 局部图原来用的是 `VoxelLayer`，但它把 z 索引塞进 uint32 的低/高 16 位、
@@ -377,9 +416,11 @@ free_thresh: 0.25
   （表现为局部图恒为 0/6400、怎么拖障碍物都没反应）。`/scan` 本来就是
   一平面 2D 扫描，没有立体信息，因此改成和全局图一样的 `ObstacleLayer`，
   只用 `min/max_obstacle_height` 做高度过滤，不再有隐式 z 窗口。
-- 两个图层的 `min_obstacle_height` 都是 `-2.0`：FAST-LIO 的 odom 原点在
+- 两个**图层级**的 `min_obstacle_height` 都是 `-2.0`：FAST-LIO 的 odom 原点在
   IMU 起始位姿上（离地约 1.15 m），`base_link` 在 odom 系 z ≈ -0.96，
   `/scan` 的点也在这一高度，用默认的 0.0 会把所有点当"地面以下"丢掉。
+  注意高度过滤执行两次：`ObservationBuffer` 先按**数据源级**参数过滤一遍，
+  `updateBounds` 再用**图层级**参数过滤一遍，两级都必须放行。
 
 ### 7.3 速度控制链（已实测核实）
 
@@ -405,6 +446,185 @@ behavior_server(恢复行为) ────────────────�
 8. 轮子转动 → `/joint_states`；IMU → `/livox/imu`；雷达 → `/livox/lidar`；
 9. FAST-LIO → `odom→base_link` TF + `/cloud_registered`；重定位节点做 ICP → `map→odom` TF；
 10. 代价地图更新、机器人到达目标（误差 < `xy_goal_tolerance` + `yaw_goal_tolerance` 即判定成功）。
+
+### 7.5 全覆盖清扫任务（`coverage_mission`）
+
+面向"地下车库洗地机器人"的整区覆盖任务。`navigation.launch.py` 加
+`coverage:=true` 时会额外拉起 `coverage_mission/launch/coverage.launch.py`，
+其中包含两个节点：
+
+| 节点 | 来源 | 职责 |
+|------|------|------|
+| `coverage_server` | `opennav_coverage`（Fields2Cover 2.1.1） | 提供 `compute_coverage_path` action，把区域多边形规划成有序 swath |
+| `coverage_executor` | `src/coverage_mission` | 任务状态机：去起点 → 规划 → 逐条 swath 转场/跟踪 → 避障回轨 |
+
+参数在 `src/coverage_mission/config/coverage_params.yaml`，覆盖区域在
+`config/coverage_area.yaml`（由 `area_extractor.py` 从 `my_map.pgm` 提取，
+外环 68 点、5 个孔洞对应车库里的柱子）。
+
+**规划阶段**
+
+- 区域多边形已按车体尺寸内缩，**不生成 headland / 分解**，直接在多边形上
+  生成 swath（`generate_headland=false`、`generate_decomp=false`），
+  `operation_width=0.8` 即洗盘宽度 = 相邻 swath 间距；
+- **规划时忽略孔洞**（`plan_ignore_holes=true`）：Fields2Cover 对"外环 + 孔洞"
+  的多边形会按子区域分别生成条带，各子区域锚点不同，实测出现 0.1~0.5 m 的
+  重复行与 0.2~1.0 m 的漏扫行——34 条/273 m，按 0.8 m 宽度栅格化的覆盖率只有
+  81%（核心区 85%）。去掉孔洞后条带是整场统一的 0.8 m 网格：23 条直条带，
+  覆盖率 94%、核心区 98%；
+- **执行前按孔洞裁剪**（`clip_swaths_at_holes=true`，`hole_clearance=0.15`）：
+  规划忽略孔洞是为了网格统一，但条带不能真的开进柱子/结构物。执行器沿每条
+  swath 每 0.05 m 采样，把落在孔洞内或距孔洞边界不足 0.15 m 的部分裁掉，
+  剩下的连续段逐段执行（段内 `FollowPath`，段间 `NavigateToPose` 绕过去）。
+  区域多边形已让孔洞比真实障碍外扩约 0.55 m，所以断点处车头（前伸 0.545 m）
+  离障碍仍有约 0.15 m。本场地 23 条 → 37 段、总长 326.8 → 282.3 m；
+  临时出现的障碍物（如测试箱子）仍由执行期前视检查绕行回轨处理——
+  这正是需求里"避让后回到原轨道"要处理的情况。实测一次完整任务
+  （run11）：37/37 段全部执行完成，0 跳过、0 终止；静态柱子全部由
+  预裁剪绕开，只发生 3 次段末停滞兜底（均 1 次 tick 内立即回轨）；
+- 只请求 `generate_route=true`，不请求 `generate_path`：DUBIN 生成的连接段
+  会被标成 swath 混进列表，变成横穿车库的斜线；
+- 本车库实测：23 条 swath，`compute_coverage_path` 往返耗时约 0.1 s。
+
+**执行状态机**（`coverage_executor.py`）
+
+```
+WAIT_READY → START_NAV_SEND/WAIT
+           → PLAN_SEND/WAIT
+           → 每条 swath: TRANSIT_SEND → TRANSIT_PLAN_WAIT → EXEC_SEND/WAIT
+                         ↳ 被挡/停滞: DETOUR_CANCEL_WAIT → DETOUR_PLAN_WAIT
+                           → 回轨后继续 EXEC
+           → DONE
+```
+
+- **去清扫起点**：机器人不在起点时先 `NavigateToPose` 到
+  `coverage_area.yaml` 里的起点（本图 `[-2.173, -4.996]`），到达后才请求规划；
+- **弧形换轨**（`arc_connector=true`，优先）：换轨不再走点到点规划，而是
+  以当前车头方向和下一条带的行进方向为起终切向生成曲线（弓字形的 180°
+  掉头用半圆，其余用三次贝塞尔半椭圆），再接上条带，
+  **一条 `FollowPath` 直接跟踪**。起点切向就是车头方向，因此不需要
+  "先停、原地转向、再起步"；终点切向就是条带方向，并入时是相切的。
+  曲线只由条带间距/朝向生成，与具体地图无关；下发前用代价地图的
+  致命栅格（`arc_lethal_threshold=100`）+ 车体半宽
+  （`arc_clearance=0.35 m`）校验，贴到障碍物/地图未就绪才回退。
+  合并路径发布在 `coverage/transit_path`，RViz 里可直接看到。
+  - **提前转弯**（`turn_inset_ratio=0.5`、`turn_inset_max=0.6 m`）：如果下一条
+    swath 的起点就在本段末端附近（典型 U 形换轨），当前条带在末端前
+    `0.5×横向间距` 处结束跟踪，机器人从一个更靠里的点开始画弧，弧顶不会
+    越过条带端头顶进障碍物膨胀层；纵向已经错开的换轨（跨孔洞/斜向）自动
+    不提前，避免额外漏扫。
+  - **对称 U 形掉头**：掉头时弧线终点不硬拉到贴近墙面的下一条带真正起点，
+    而是取"与起点同一纵向坐标、横向一个车道间距"的点，用真正的半圆
+    （半径 = 半个车道间距，0.8 m 车道时 0.4 m ≥ `min_turning_radius`）
+    连接；下一条 swath 从半圆终点对应的 `s` 开始跟踪，端头那一小段由
+    半圆扫过的 0.8 m 清洗带覆盖。这样弧顶只到"提前停轨点 − 0.4 m"，
+    距条带端点还有余量，既不贴墙也不进膨胀层；曲率恒定，比贝塞尔更容易
+    让 MPPI 平稳跟随。横向间距 < 0.7 m（半径低于最小转弯半径）时自动
+    退回贝塞尔换轨。
+  - **掉头速度调参**（`nav2_params.yaml` 的 `vx_std=0.4`、`wz_std=0.8`）：
+    实测掉头曾慢到 16 s 才走完 1.26 m 半圆（均速 0.078 m/s）。链路记录确认
+    是 MPPI 自己只下发 `nav_v≈0、nav_w≈0.10 rad/s`，底盘与代价地图正常
+    （全局代价地图沿半圆全为 0）。根因是采样标准差过小：半圆要求持续
+    `vx≈0.5、wz≈1.25`，对应 2.5σ/3.1σ，白噪声采样几乎不可能生成一条全程
+    跟住半圆的轨迹；而横向偏差惩罚（PathAlign 权重 14）在"停在弧线起点"
+    时为 0，softmax 加权平均于是收敛到"原地极慢转"。放大采样标准差后
+    半圆轨迹进入采样集，掉头耗时降到约 4 s（均速 0.31 m/s）。实测直线段
+    横向偏差 rms 仅 0.01 m，条带跟踪精度不受影响；调 PathAlign/PathFollow
+    权重无效，故未改动。
+  - 距离 > `arc_connector_max_length`（3.0 m，TSP 跨区跳跃）或弧线不可行时，
+    回退到下面的规划器转场；
+- **规划器平滑转场**（`smooth_transit=true`，回退）：`TRANSIT_SEND` 调用
+  planner_server 的 `compute_path_to_pose`（`use_start=false`，NavFn，
+  实测 0.05~0.1 s）规划一条到条带起点的路径，再把从起点到终点的条带按
+  0.1 m 间隔拼到路径末尾，**只发一条 `FollowPath`**（`coverage_goal_checker`）。
+  MPPI 在路径拐点处沿切线自然并入条带，全程没有停车转向。
+  - 规划失败/超时（`plan_timeout=10 s`）自动回退 `NavigateToPose`
+    （`general_goal_checker` 0.6 m / 0.6 rad）；
+  - 距离小于 `transit_tolerance`（0.6 m）时仍跳过转场，直接交给
+    `FollowPath` 顺带走过去——实测 MPPI 在"小距离 + 大角度"终点会反复
+    触发进度检查失败；
+  - 合并路径前半段是转场，机器人可能离当前条带很远：只有横向距离
+    ≤ `on_line_tolerance`（1.0 m）才做前视障碍/停滞检查，避免把转场
+    途中路过的柱子误判成"当前条带被挡"；转场段停滞 5 s 回退
+    `NavigateToPose`，连续两次则跳过该条带;
+- **逐条跟踪**：`FollowPath` + `coverage_goal_checker`（0.12 m / 0.10 rad），
+  BT 里必须显式写 `goal_checker_id`（有两个 goal checker 时空字符串会报错）。
+  终点容差 0.12 m：条带终点离墙只有约 0.3 m，MPPI 在膨胀层附近压不进 5 cm，
+  实测每条 swath 都在终点 0.07~0.10 m 处停住，5 s 后被"进度停滞"兜底误判成
+  绕行（多花 5 s 且发出一条假的 `blocked_interval`）；
+- **避障回轨**：见下节。
+
+**避障与"回到同一条轨道"**
+
+`SwathSupervisor` 订阅 `global_costmap/costmap`，沿当前 swath 前视
+`lookahead=3.0 m`，在以 swath 为中心、半宽 `corridor_half_width=0.25 m`
+的走廊里采样代价，只有 `>= lethal_cost_threshold(100)` 才算被挡
+（避开膨胀层的 253 内接值误报）：
+
+1. `find_rejoin` 从障碍物之后继续扫描，找一段连续 `clear_run=1.4 m`
+   的干净走廊；
+2. 回轨点取这段干净走廊起点再往后 `rejoin_margin=1.3 m`，**严格落在原
+   swath 直线上**（不是回到原点，也不是回到障碍物前的那个点）；
+3. 执行器取消 `FollowPath`，用同一套平滑机制回轨：先
+   `compute_path_to_pose` 规划到回轨点的路径，再把回轨点之后的剩余条带
+   拼上去，发一条 `FollowPath`（规划失败才回退 `NavigateToPose`）；
+   成功后把 `_swath_start_s` 设为回轨点的弧长 s，**继续跟踪同一条
+   swath 的剩余段**；
+4. 找不到回轨点 / 绕行导航失败 / 单条 swath 绕行超过
+   `max_detours_per_swath=3` 次 → 跳过该 swath 剩余段，继续下一条，
+   任务不会因为一个障碍物整体中断。
+
+**障碍密集区跳扫**（`dense_obstacle_skip=true`）
+
+静态孔洞由预裁剪处理，但孔洞之外还可能有噪声、堆放物等密集障碍。
+`SwathSupervisor.scan()` 以 0.1 m 步长扫描走廊，返回被挡比例和连续
+被挡区间，执行器据此做三档决策：
+
+- **转场前预检**：整条 swath 被挡比例 ≥ `dense_swath_ratio`（0.5）
+  → 整条跳过，根本不开过去（换轨道）；
+- **执行中**：剩余段被挡比例 ≥ 0.5 → 跳过剩余段，换下一条 swath；
+- **前方障碍群**：`dense_scan_ahead`（6 m）内存在连续长度
+  ≥ `dense_cluster_length`（2 m）的障碍群 → 直接跳到障碍群之后
+  `rejoin_margin` 处，从那里继续清扫（换到轨道的某一点开始）；
+- 不满足以上条件才走原来的"单障碍绕行回轨"逻辑，避免一个障碍物一个
+  障碍物地反复绕行、把时间耗在密集区里。
+
+> `rejoin_margin` 不能太小：2D 代价地图只能看到障碍物**朝向机器人一侧的
+> 表面**，回轨点是从表面之后量起的；车身后半段长 0.54 m，若障碍物本身
+> 有 0.5 m 厚，余量取 1.0 m 时回轨瞬间车尾会离箱体远侧只剩十几厘米。
+> 权衡后取 1.3 m，多跳过的 0.3 m 远小于撞上再重试的代价。
+
+**进度停滞兜底**：代价地图看不到的卡死（例如贴着障碍物原地磨）由
+`0.1 m / 0.15 rad / 5 s` 的停滞检测兜住，此时用 `find_free_ahead`
+在前方 2.5 m 内找一个可通行点作为绕行目标，然后同样回轨。若停滞/失败点
+距条带终点 ≤ `end_stall_tolerance`（1 m），不再绕行，直接结束该段：
+条带终点离墙约 0.3 m，MPPI 在膨胀层附近压不进 0.12 m 的终点容差，
+否则会在段末反复"停滞 → 回轨到同一点"（实测每次白耗几十秒）。
+
+**定位跳变保护**：执行器每个 tick 检查 `map→base_link`，相邻 tick（≤1 s）
+跳变超过 `pose_jump_limit=5 m`、或跑出所有分区包围盒外
+`pose_sanity_margin=5 m`，立即取消当前 goal 并终止任务。实测 FAST-LIO 在
+地图噪声/障碍密集区会突然发散（位姿几秒内飘出几十米，odom 最终到公里级），
+没有这道保护时执行器会继续用发散位姿发指令，车在场地里盲开；现在会立刻
+停车并打印 `任务终止：定位跳变 …`，重新定位后再 `/coverage/start` 即可。
+
+**话题 / 服务**
+
+| 名称 | 类型 | 说明 |
+|------|------|------|
+| `coverage/status` | `std_msgs/String` | 状态文本（含 swath 序号、绕行次数、跳过数） |
+| `coverage/current_swath` | `nav_msgs/Path` | 当前执行的 swath（TRANSIENT_LOCAL，晚加入的 RViz 也能拿到） |
+| `coverage/planned_path` | `nav_msgs/Path` | 全部 swath：每条依次放起点、终点，连起来即完整往复覆盖路线（TRANSIENT_LOCAL） |
+| `coverage_view.rviz` | RViz 配置 | `coverage:=true` 时自动加载，预置上述话题的显示项并俯视整场 |
+| `coverage/transit_path` | `nav_msgs/Path` | 平滑转场实际下发的"接近路径 + 条带"合并路径（TRANSIENT_LOCAL） |
+| `coverage/blocked_interval` | `visualization_msgs/Marker` | 本次绕行被跳过的区间 |
+| `coverage/rejoin_pose` | `geometry_msgs/PoseStamped` | 绕行回轨点 |
+| `coverage/start` / `coverage/cancel` | `std_srvs/Trigger` | 手动开始/取消（`auto_start=false` 时用） |
+
+**依赖注意**：`coverage_server` 需要 Fields2Cover 2.1.1（`ros-humble-fields2cover`）。
+本机未用 apt 安装，验证时用 `/tmp/f2c_prefix` 前缀提供；正式部署请
+`sudo apt install ros-humble-fields2cover` 后重新 `colcon build`
+`opennav_coverage_msgs opennav_coverage coverage_mission`。
 
 ---
 
@@ -493,7 +713,7 @@ prior_3d_map.pcd ───┘            ├──► /localization_pose（定�
 src/sam_bot_description/map/my_map.yaml ──► map_server ──► /map ──► global_costmap
                                             │
 /scan ──────────┐                           │
-/cloud_registered ──┴──► 两张图的障碍层（标记 + 稠密清除）
+/cloud_registered_body ─┴──► 两张图的障碍层（标记 + 稠密清除，frame=livox_imu）
                                             ▼
 RViz 目标 ──► bt_navigator ──► planner_server ──► 全局路径 ──► controller_server
                                                                   │
@@ -514,7 +734,8 @@ local_costmap ──────────────────────
 | `/demo/odom` | Odometry | diff_drive | （仅调试用，导航不消费） |
 | `/livox/imu` | Imu | imu_sensor 插件 | fastlio_mapping |
 | `/livox/lidar` | PointCloud2 | mid360 插件 | fastlio_mapping、pointcloud_to_laserscan |
-| `/cloud_registered` | PointCloud2 | fastlio_mapping（odom 系、去畸变） | fastlio_relocalization、两张代价地图的障碍层（稠密清除） |
+| `/cloud_registered` | PointCloud2 | fastlio_mapping（odom 系、去畸变） | fastlio_relocalization（ICP） |
+| `/cloud_registered_body` | PointCloud2 | fastlio_mapping（**livox_imu** 系、去畸变） | 两张代价地图的障碍层（标记 + 稠密清除） |
 | `/Odometry` | Odometry | fastlio_mapping | 重定位节点（取时间戳/调试） |
 | `/scan` | LaserScan | pointcloud_to_laserscan（由 `/livox/lidar` 投影） | global_costmap、local_costmap |
 | `/joint_states` | JointState | joint_state_publisher 插件 | robot_state_publisher |

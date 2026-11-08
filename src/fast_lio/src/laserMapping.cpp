@@ -525,7 +525,16 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shared
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*laserCloudIMUBody, laserCloudmsg);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = "base_link";
+    // 【修正】这里发的是 **IMU 体系**：上面 RGBpointBodyLidarToIMU 用 Lidar_R_wrt_IMU
+    // 把点从雷达系转到了 IMU 系。原先标成 base_link 是错的 —— URDF 里 IMU 在
+    // base_link 上方 0.89 m（livox 在 0.93 m），nav2 的 ObservationBuffer 会用
+    // odom<-base_link（z≈-0.96）而不是 odom<-livox_imu（z≈-0.07）去变换整帧点云，
+    // 结果所有点被压低 0.89 m：地面从 -1.15 变成 -2.04，1 m 高的箱子从
+    // [-1.15,-0.15] 变成 [-2.04,-1.04]，全部落在局部代价地图的高度带
+    // min_obstacle_height=-0.85 以下被丢掉 —— 表现就是"拖进来的障碍物检测不到、
+    // 直接撞上去"。标成 livox_imu 后 odom->base_link->livox->livox_imu 整条链自洽，
+    // 变换后的点云与 /cloud_registered 完全一致。
+    laserCloudmsg.header.frame_id = "livox_imu";
     pubLaserCloudFull_body->publish(laserCloudmsg);
     publish_count -= PUBFRAME_PERIOD;
 }

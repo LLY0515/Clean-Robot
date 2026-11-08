@@ -3,6 +3,10 @@
   Custom behavior tree: identical to nav2_bt_navigator's
   navigate_through_poses_w_replanning_and_recovery.xml, except the BackUp
   recovery action is removed — this robot must never reverse.
+
+  FollowPath 显式指定 goal_checker_id：controller_server 里注册了
+  general_goal_checker 和 coverage_goal_checker 两个插件，默认 BT 传空字符串
+  会导致 "does not exist" 报错。转场用宽松的 general_goal_checker。
 -->
 <root main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
@@ -18,7 +22,7 @@
           </RecoveryNode>
         </RateController>
         <RecoveryNode number_of_retries="1" name="FollowPath">
-          <FollowPath path="{path}" controller_id="FollowPath"/>
+          <FollowPath path="{path}" controller_id="FollowPath" goal_checker_id="general_goal_checker"/>
           <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
         </RecoveryNode>
       </PipelineSequence>
@@ -29,7 +33,9 @@
             <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
             <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
           </Sequence>
-          <Spin spin_dist="1.57"/>
+          <!-- 不用 Spin：原地转 1.57 rad 会把朝向越转越偏，转场终点本来就是
+               小距离 + 大角度修正，Spin 只会让下一轮重新对准更困难。 -->
+          <Wait wait_duration="2"/>
           <Wait wait_duration="5"/>
         </RoundRobin>
       </ReactiveFallback>

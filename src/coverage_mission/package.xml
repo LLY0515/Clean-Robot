@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>coverage_mission</name>
+  <version>0.1.0</version>
+  <description>
+    地下车库洗地机器人全覆盖任务包：
+    - extract_coverage_area：从 2D 栅格地图提取可清扫区域（外环 + 柱子孔洞）
+    - coverage_executor：调用 opennav_coverage 规划覆盖路径，先转场到清扫起点，
+      再逐条 swath 精确跟踪；前方轨道被挡时绕行并回到同一条轨道继续。
+
+    注意：opennav_coverage 在 Humble 上只使用 Coverage Server（ComputeCoveragePath），
+    不使用需要 Iron+ 的 CoverageNavigator 插件。
+  </description>
+  <maintainer email="lunyi@todo.todo">lunyi</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>action_msgs</exec_depend>
+  <exec_depend>nav2_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>tf2_geometry_msgs</exec_depend>
+  <exec_depend>opennav_coverage_msgs</exec_depend>
+  <exec_depend>opennav_coverage</exec_depend>
+  <exec_depend>nav2_lifecycle_manager</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

@@ -25,12 +25,14 @@
 // ============================================================================
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -61,7 +63,17 @@ using CloudT = pcl::PointCloud<PointT>;
 
 constexpr double kPi = 3.14159265358979323846;
 
-// 把 4x4 变换投影为地面机器人可用的 (x, y, yaw)：z、roll、pitch 归零。
+// 把 4x4 变换投影为地面机器人可用的 (x, y, z, yaw)：roll、pitch 归零。
+//
+// 【修正】z 平移必须保留。实测 FAST-LIO 在这套仿真里 odom 的 z 会缓慢漂移
+// （10 分钟内约 1 m），原来把 z 归零后 map->odom 只能修 x/y/yaw，扫描点云
+// 在 map 系里整体高出先验地图约 1 m：
+//   * scorePose 用 3D 最近邻，地面点全部对不上，内点率从 1.00 掉到 0.3~0.4；
+//   * 跟踪因此反复失败并冻结 map->odom，FAST-LIO 继续漂移，扫描点被投到
+//     错误的地图位置，代价地图上出现"幽灵障碍"，覆盖任务误判 swath 被挡
+//     （实测 swath 7/8 被误挡、转场连续失败后任务终止）。
+// 允许 map->odom 的 z 吸收这部分高度漂移后，3D 配准始终对齐；Nav2 的 2D
+// 代价地图和有覆盖规划都只看 x/y/yaw，多出来的 z 平移没有任何副作用。
 Eigen::Matrix4f planarize(const Eigen::Matrix4f& T) {
   const Eigen::Matrix3f R = T.block<3, 3>(0, 0);
   const float yaw = std::atan2(R(1, 0), R(0, 0));
@@ -70,7 +82,7 @@ Eigen::Matrix4f planarize(const Eigen::Matrix4f& T) {
       Eigen::AngleAxisf(yaw, Eigen::Vector3f::UnitZ()).toRotationMatrix();
   out(0, 3) = T(0, 3);
   out(1, 3) = T(1, 3);
-  out(2, 3) = 0.0f;
+  out(2, 3) = T(2, 3);
   return out;
 }
 
@@ -179,6 +191,12 @@ class RelocalizationNode : public rclcpp::Node {
                 prior_map_path_.c_str(), scan_topic_.c_str(), rate);
   }
 
+  ~RelocalizationNode() override {
+    if (search_thread_.joinable()) {
+      search_thread_.join();
+    }
+  }
+
  private:
   void declareParameters() {
     prior_map_path_ = declare_parameter<std::string>("prior_map_path", "");
@@ -228,6 +246,22 @@ class RelocalizationNode : public rclcpp::Node {
     global_search_height_ =
         declare_parameter<double>("global_search_height", 0.35);
 
+    // 全局结果的“平均最近邻距离”上限。内点率只统计距离 < inlier_distance
+    // 的点，得分 0.55 ~ 0.6 的误匹配也能过线；实测一次错误解内点率 0.60、
+    // 平均最近邻 0.487 m（正确解约 0.07~0.10 m），map->odom 被拉偏 3 m，
+    // 正在执行的 FollowPath 直接因“0 poses”中止。加上这个上限后，
+    // 只有真正贴合先验地图的解才会被接受。
+    max_relocalize_mean_dist_ =
+        declare_parameter<double>("max_relocalize_mean_dist", 0.30);
+    // 相对上一次 map->odom 的允许跳变。正常跟踪时 map->odom 近似不变
+    // （FAST-LIO 的 odom 与地图同步漂移），跳 3 m 只可能是误匹配。
+    // 只有得分足够高（>= strict_relocalize_score）才允许大跳变，
+    // 以兼顾“机器人被搬动后重新定位”的真实场景。
+    max_relocalize_jump_ =
+        declare_parameter<double>("max_relocalize_jump", 2.0);
+    strict_relocalize_score_ =
+        declare_parameter<double>("strict_relocalize_score", 0.85);
+
     constrain_planar_ = declare_parameter<bool>("constrain_planar", true);
     relocalize_on_start_ =
         declare_parameter<bool>("relocalize_on_start", true);
@@ -273,6 +307,19 @@ class RelocalizationNode : public rclcpp::Node {
     map_tree_.setInputCloud(map_);
     map_tree_ready_ = true;
     pcl::getMinMax3D(*map_, map_min_, map_max_);
+
+    // z 分布中位数：用于估计 map->odom 的高度平移初值（见 estimateZShift）。
+    if (!map_->empty()) {
+      std::vector<float> zs;
+      zs.reserve(map_->size());
+      for (const auto& p : map_->points) {
+        zs.push_back(p.z);
+      }
+      const std::size_t mid = zs.size() / 2;
+      std::nth_element(zs.begin(), zs.begin() + mid, zs.end());
+      map_z_median_ = zs[mid];
+      map_z_median_ready_ = true;
+    }
 
     // 全局搜索用的“上部结构”子图：只保留最高点以下 global_search_height_ 内的点。
     if (global_search_height_ > 0.0 && !map_->empty()) {
@@ -348,6 +395,12 @@ class RelocalizationNode : public rclcpp::Node {
   void timerCallback() {
     std::lock_guard<std::mutex> lock(mutex_);
 
+    // 【关键】全局搜索单次约 3~4 s。若在定时器回调里同步执行，这段时间
+    // map->odom 完全不更新；Nav2 用“当前时刻”查 TF 会报
+    // "Lookup would require extrapolation into the future"，controller_server
+    // 随即中止 FollowPath（实测导致覆盖任务转场连续失败、整任务终止）。
+    // 因此把搜索放到独立线程，主定时器每次无论如何都先把上一帧 map->odom
+    // 发出去，保证 TF 始终以 publish_rate_ 连续存在。
     if (!map_loaded() || !latest_scan_) {
       // 地图还没加载或还没有点云：至少把 map->odom 维持住。
       if (has_map_to_odom_) {
@@ -378,8 +431,42 @@ class RelocalizationNode : public rclcpp::Node {
     }
 
     if (global_search_pending_) {
-      globalSearch(scan);
-    } else if (localized_) {
+      // 先发布维持 TF，再考虑起后台搜索。
+      if (has_map_to_odom_) {
+        publishTfAndPose();
+      }
+      if (!search_running_.exchange(true)) {
+        if (search_thread_.joinable()) {
+          search_thread_.join();
+        }
+        // 把当前 map->odom 的 z 作为搜索的 z 初值：FAST-LIO 的 z 会漂移，
+        // 搜索时若固定 z=0，重定位在当前高度上永远对不齐（见 planarize 注释）。
+        const float base_z = T_map_odom_(2, 3);
+        // 同时把搜索开始时的 map->odom 传给后台线程，用于拒绝不合理的跳变。
+        // 定时器回调全程持有 mutex_，这里读取是安全的。
+        const Eigen::Matrix4f prev_T = T_map_odom_;
+        const bool has_prev = has_map_to_odom_;
+        // z 中位数估计的校准量也在这里取快照：后台线程不持锁，直接读成员
+        // 会与跟踪线程的更新形成数据竞争。
+        const float z_bias = z_median_bias_;
+        const bool z_calibrated = z_median_calibrated_;
+        search_thread_ = std::thread(
+            [this, scan, base_z, prev_T, has_prev, z_bias, z_calibrated]() {
+              runGlobalSearchAsync(scan, base_z, prev_T, has_prev, z_bias,
+                                   z_calibrated);
+            });
+      }
+      return;  // 搜索期间 icp_ 被后台线程占用，不做 tracking
+    }
+    if (search_running_) {
+      // 后台搜索刚成功、标志位还没落下：这一拍只维持 TF。
+      if (has_map_to_odom_) {
+        publishTfAndPose();
+      }
+      return;
+    }
+
+    if (localized_) {
       track(scan);
     }
 
@@ -388,12 +475,54 @@ class RelocalizationNode : public rclcpp::Node {
     }
   }
 
+  // 用 z 分布中位数估计当前帧相对先验地图的平移量（即 map->odom 的 z）。
+  //
+  // 背景：FAST-LIO 的 odom 高度会突跳/漂移（实测单次可达 1 m 以上），此时
+  // 上一帧 map->odom 的 z 已经过期。跟踪 ICP 在 z 方向差超过 inlier_distance
+  // （0.35 m）就无法收敛，连续失败后触发全局搜索；而全局搜索又用这个过期的
+  // z 当初值，候选位姿全部对不上，日志出现“最高内点率 0.00”，重定位永远
+  // 失败（实测覆盖任务运行到第 12 条 swath 附近时反复出现）。
+  // 先验地图与当前帧是同一场地，两者 z 分布的中位数之差就是平移量，可独立
+  // 于 x/y/yaw 的误差，作为 z 初值足够准（±0.2 m 内），再交给 ICP 精修。
+  bool estimateZShift(const CloudT::Ptr& scan, float& z_out) const {
+    if (!map_z_median_ready_ || scan->size() < 100) {
+      return false;
+    }
+    std::vector<float> zs;
+    zs.reserve(scan->size());
+    for (const auto& p : scan->points) {
+      zs.push_back(p.z);
+    }
+    const std::size_t mid = zs.size() / 2;
+    std::nth_element(zs.begin(), zs.begin() + mid, zs.end());
+    z_out = map_z_median_ - zs[mid];
+    return true;
+  }
+
   // -------------------------------------------------------------------------
   //  跟踪：以上一帧 map->odom 为初值做 ICP
   // -------------------------------------------------------------------------
   void track(const CloudT::Ptr& scan) {
+    // z 初值：FAST-LIO 的 odom 高度突跳时，上一帧 map->odom 的 z 已经过期。
+    // 偏差超过 0.5 m 就先用分布中位数估计值替换，避免 z 方向直接跟丢。
+    // 注意：中位数估计含有与场地/视角相关的系统偏差（实测约 0.5 m，
+    // 先验地图与单帧点云的 z 分布形状不同），必须先用成功跟踪的帧校准
+    // （见下方 z_median_bias_ 的更新），否则会每帧都注入 0.5 m 的错位。
+    float z_raw = 0.0f;
+    const bool has_z_est = estimateZShift(scan, z_raw);
+    const float z_est =
+        (has_z_est && z_median_calibrated_) ? z_raw - z_median_bias_ : z_raw;
+    Eigen::Matrix4f init = T_map_odom_;
+    if (has_z_est && std::abs(z_est - init(2, 3)) > 0.5f) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "FAST-LIO 高度跳变：map->odom 的 z 初值 %.2f -> "
+                           "%.2f m（按 z 分布中位数修正）",
+                           init(2, 3), z_est);
+      init(2, 3) = z_est;
+    }
+
     Eigen::Matrix4f estimate;
-    if (!runIcp(scan, T_map_odom_, icp_corr_dist_tracking_, estimate)) {
+    if (!runIcp(scan, init, icp_corr_dist_tracking_, estimate)) {
       onTrackingFailure("ICP 未收敛");
       return;
     }
@@ -402,21 +531,61 @@ class RelocalizationNode : public rclcpp::Node {
     }
 
     double mean_dist = 0.0;
-    const double score =
+    double score =
         scorePose(*scan, estimate, inlier_distance_, mean_dist);
+
+    // 兜底：z 初值被修正过时，用原始初值（上一帧 map->odom）再跑一次 ICP，
+    // 取评分更高的结果。分布估计有约 0.5 m 的抖动（见 estimateZShift），
+    // 一旦修正方向错了，ICP 会滑进错误的局部极小（实测内点率 0.45~0.52、
+    // 平均最近邻 0.4~0.5 m）；双初值取优能保证修正只会帮忙、不会帮倒忙。
+    if (has_z_est && std::abs(init(2, 3) - T_map_odom_(2, 3)) > 1e-6f) {
+      Eigen::Matrix4f alt;
+      if (runIcp(scan, T_map_odom_, icp_corr_dist_tracking_, alt)) {
+        if (constrain_planar_) {
+          alt = planarize(alt);
+        }
+        double alt_mean = 0.0;
+        const double alt_score =
+            scorePose(*scan, alt, inlier_distance_, alt_mean);
+        if (alt_score > score) {
+          estimate = alt;
+          score = alt_score;
+          mean_dist = alt_mean;
+        }
+      }
+    }
+
     if (score < min_inlier_ratio_) {
-      onTrackingFailure("内点率过低");
+      onTrackingFailure("内点率过低", score, mean_dist);
       return;
     }
 
     // 防止单帧 ICP 把 map->odom 拉飞：与上一帧相比平移/偏航跳变过大就丢弃。
+    // 只检查平面位移：z 本来就在吸收 FAST-LIO 的高度漂移（见 planarize），
+    // 一次修正 1 m 以上是正常的，不应算作“拉飞”。
     const Eigen::Matrix4f delta = T_map_odom_.inverse() * estimate;
-    const double jump = delta.block<3, 1>(0, 3).norm();
+    const double jump = std::hypot(delta(0, 3), delta(1, 3));
     const double yaw_jump =
         std::abs(std::atan2(delta(1, 0), delta(0, 0)));
     if (jump > max_tracking_jump_ || yaw_jump > max_tracking_yaw_jump_) {
-      onTrackingFailure("位姿跳变过大");
+      onTrackingFailure("位姿跳变过大", score, mean_dist);
       return;
+    }
+
+    // 校准 z 中位数估计的系统偏差：成功对齐的帧上，estimate 的 z 就是
+    // 真实的 map->odom z，与分布估计值之差即偏差。用 EMA 平滑，避免单帧
+    // 噪声污染。
+    if (has_z_est) {
+      const float new_bias = z_raw - estimate(2, 3);
+      if (!z_median_calibrated_) {
+        z_median_bias_ = new_bias;
+        z_median_calibrated_ = true;
+        RCLCPP_INFO(get_logger(),
+                    "z 分布估计已校准：系统偏差 %.2f m（估计 %.2f，实际 %.2f）",
+                    z_median_bias_, z_raw, estimate(2, 3));
+      } else {
+        z_median_bias_ = 0.9f * z_median_bias_ + 0.1f * new_bias;
+      }
     }
 
     T_map_odom_ = blend(T_map_odom_, estimate,
@@ -433,11 +602,22 @@ class RelocalizationNode : public rclcpp::Node {
     }
   }
 
-  void onTrackingFailure(const char* reason) {
+  // score / mean_dist 由评分阶段传入，便于诊断“为什么失败”。
+  // 传负值表示该原因没有评分结果（如 ICP 未收敛）。
+  void onTrackingFailure(const char* reason, double score = -1.0,
+                         double mean_dist = -1.0) {
     ++fail_count_;
-    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
-                         "3D 跟踪失败（%s），连续失败 %d/%d 次", reason,
-                         fail_count_, relocalize_fail_count_);
+    if (score >= 0.0) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+                           "3D 跟踪失败（%s：内点率 %.2f，平均最近邻 "
+                           "%.3f m），连续失败 %d/%d 次",
+                           reason, score, mean_dist, fail_count_,
+                           relocalize_fail_count_);
+    } else {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+                           "3D 跟踪失败（%s），连续失败 %d/%d 次", reason,
+                           fail_count_, relocalize_fail_count_);
+    }
     if (fail_count_ >= relocalize_fail_count_) {
       RCLCPP_WARN(get_logger(), "连续跟踪失败，触发全局重定位。");
       fail_count_ = 0;
@@ -449,18 +629,56 @@ class RelocalizationNode : public rclcpp::Node {
   // -------------------------------------------------------------------------
   //  全局重定位：(x, y, yaw) 栅格搜索 + ICP 精配准
   // -------------------------------------------------------------------------
-  void globalSearch(const CloudT::Ptr& scan) {
+  struct GlobalSearchResult {
+    double best_score = -1.0;
+    Eigen::Matrix4f best_T = Eigen::Matrix4f::Identity();
+    double mean_dist = 0.0;
+    // 是否通过全部验收条件（内点率、平均最近邻距离、相对跳变）。
+    bool accepted = false;
+    // 未通过验收时为拒绝原因，用于日志。
+    const char* reject_reason = "";
+  };
+
+  // 纯计算：不修改任何共享状态，也不碰 mutex_。由后台线程调用，
+  // 结果返回后再在锁内更新 T_map_odom_ 等状态。
+  // prev_T / has_prev：搜索开始时的 map->odom，用于拒绝不合理的跳变。
+  // z_bias / z_calibrated：z 中位数估计的校准量（调用时在锁内取快照）。
+  GlobalSearchResult computeGlobalSearch(const CloudT::Ptr& scan, float base_z,
+                                         const Eigen::Matrix4f& prev_T,
+                                         bool has_prev, float z_bias,
+                                         bool z_calibrated) {
     const auto begin = std::chrono::steady_clock::now();
     RCLCPP_INFO(get_logger(), "开始全局重定位：在 %.2f m 栅格上搜索 (x, y, yaw) ...",
                 global_search_xy_step_);
+
+    // z 初值：上一帧 map->odom 的 z 可能已经因 FAST-LIO 高度跳变而过期。
+    // 用 z 分布中位数重新估计，偏差明显时以估计值为准（见 estimateZShift）。
+    float z_seed = base_z;
+    {
+      float z_est = 0.0f;
+      if (estimateZShift(scan, z_est)) {
+        // 扣掉系统偏差（校准值由跟踪成功帧得到，见 track 里的说明）。
+        if (z_calibrated) {
+          z_est -= z_bias;
+        }
+        if (std::abs(z_est - base_z) > 0.5f) {
+          z_seed = z_est;
+          RCLCPP_INFO(get_logger(),
+                      "全局搜索 z 初值按分布中位数修正：%.2f -> %.2f m",
+                      base_z, z_seed);
+        }
+      }
+    }
 
     // 优先只用地面上方的结构做搜索（见 global_search_height 的说明）。
     CloudT::Ptr search_scan = scan;
     pcl::KdTreeFLANN<PointT>* search_tree = &map_tree_;
     if (map_top_ready_) {
       CloudT::Ptr scan_top(new CloudT);
+      // 点云在 odom 系，要减掉 map->odom 的 z 偏移再和先验地图比较高度；
+      // 否则 FAST-LIO 的 z 漂移会让“上部结构”筛选把地面也筛进来。
       const float z_min =
-          map_max_.z - static_cast<float>(global_search_height_);
+          map_max_.z - static_cast<float>(global_search_height_) - z_seed;
       scan_top->reserve(scan->size());
       for (const auto& p : scan->points) {
         if (p.z >= z_min) {
@@ -529,7 +747,9 @@ class RelocalizationNode : public rclcpp::Node {
                     .toRotationMatrix();
             T(0, 3) = x;
             T(1, 3) = y;
-            T(2, 3) = 0.0f;
+            // z 用估计值做初值（FAST-LIO 的 z 漂移见 planarize 注释）；
+            // ICP 精配准会在此基础上再修正。
+            T(2, 3) = z_seed;
             double mean_dist = 0.0;
             const double score = scorePose(*coarse, T, inlier_distance_,
                                            mean_dist, search_tree);
@@ -542,6 +762,7 @@ class RelocalizationNode : public rclcpp::Node {
       RCLCPP_WARN(get_logger(),
                   "先验地图包围盒过小，全局搜索退化为原点附近。");
       Eigen::Matrix4f T = Eigen::Matrix4f::Identity();
+      T(2, 3) = z_seed;
       for (int i = 0; i < yaw_bins; ++i) {
         T.block<3, 3>(0, 0) =
             Eigen::AngleAxisf(yaw0 + i * yaw_step, Eigen::Vector3f::UnitZ())
@@ -564,6 +785,7 @@ class RelocalizationNode : public rclcpp::Node {
 
     double best_score = -1.0;
     Eigen::Matrix4f best_T = Eigen::Matrix4f::Identity();
+    double best_mean_dist = 0.0;
     double second_score = -1.0;
     Eigen::Matrix4f second_T = Eigen::Matrix4f::Identity();
     for (std::size_t i = 0; i < keep; ++i) {
@@ -588,7 +810,7 @@ class RelocalizationNode : public rclcpp::Node {
         }
         best_score = score;
         best_T = estimate;
-        last_mean_dist_ = mean_dist;
+        best_mean_dist = mean_dist;
       } else if (score > second_score && !samePose(estimate, best_T)) {
         second_score = score;
         second_T = estimate;
@@ -614,26 +836,79 @@ class RelocalizationNode : public rclcpp::Node {
         std::chrono::duration<double>(std::chrono::steady_clock::now() - begin)
             .count();
 
-    if (best_score >= min_inlier_ratio_) {
-      T_map_odom_ = best_T;
-      localized_ = true;
-      global_search_pending_ = false;
-      fail_count_ = 0;
-      last_score_ = best_score;
+    // ---------------- 结果验收 ----------------
+    // 内点率只统计距离小于 inlier_distance 的点，单靠它挡不住“大片点是
+    // 近似贴墙、平均距离却很糟”的误匹配（实测 0.60 / 0.487 m）。因此再加
+    // 两道闸：平均最近邻距离必须足够小；相对上一次 map->odom 的大跳变必须
+    // 有足够高的得分支撑。
+    GlobalSearchResult result;
+    result.best_score = best_score;
+    result.best_T = best_T;
+    result.mean_dist = best_mean_dist;
+
+    if (best_score < min_inlier_ratio_) {
+      result.reject_reason = "内点率过低";
+    } else if (best_mean_dist > max_relocalize_mean_dist_) {
+      result.reject_reason = "平均最近邻距离过大（疑似误匹配）";
+    } else if (has_prev) {
+      // 只比较平面位移：map->odom 的 z 本来就在吸收 FAST-LIO 的高度漂移。
+      const Eigen::Matrix4f delta = prev_T.inverse() * best_T;
+      const double jump =
+          std::hypot(delta(0, 3), delta(1, 3));
+      if (jump > max_relocalize_jump_ &&
+          best_score < strict_relocalize_score_) {
+        result.reject_reason = "相对上一次 map->odom 跳变过大且得分不足";
+      }
+    }
+
+    if (result.reject_reason[0] == '\0') {
+      result.accepted = true;
       RCLCPP_INFO(get_logger(),
                   "全局重定位成功：内点率 %.2f，平均最近邻距离 %.3f m，"
-                  "map->odom = (x=%.2f, y=%.2f, yaw=%.1f°)，耗时 %.2f s",
-                  best_score, last_mean_dist_, best_T(0, 3), best_T(1, 3),
+                  "map->odom = (x=%.2f, y=%.2f, z=%.2f, yaw=%.1f°)，"
+                  "耗时 %.2f s",
+                  best_score, best_mean_dist, best_T(0, 3), best_T(1, 3),
+                  best_T(2, 3),
                   std::atan2(best_T(1, 0), best_T(0, 0)) * 180.0 / kPi,
                   elapsed);
     } else {
-      localized_ = false;
-      global_search_pending_ = true;
       RCLCPP_WARN(get_logger(),
-                  "全局重定位失败：最高内点率 %.2f < %.2f（耗时 %.2f s），"
-                  "保持上一次 map->odom 并稍后重试。",
-                  best_score, min_inlier_ratio_, elapsed);
+                  "全局重定位结果被拒绝（%s）：内点率 %.2f（阈值 %.2f），"
+                  "平均最近邻距离 %.3f m（阈值 %.3f m），"
+                  "候选 map->odom = (x=%.2f, y=%.2f, z=%.2f, yaw=%.1f°)，"
+                  "耗时 %.2f s。保持上一次 map->odom 并稍后重试。",
+                  result.reject_reason, best_score, min_inlier_ratio_,
+                  best_mean_dist, max_relocalize_mean_dist_, best_T(0, 3),
+                  best_T(1, 3), best_T(2, 3),
+                  std::atan2(best_T(1, 0), best_T(0, 0)) * 180.0 / kPi,
+                  elapsed);
     }
+    return result;
+  }
+
+  // 后台线程入口：算完后在锁内应用结果；整个过程中主定时器继续发布 TF。
+  void runGlobalSearchAsync(CloudT::Ptr scan, float base_z,
+                            const Eigen::Matrix4f& prev_T, bool has_prev,
+                            float z_bias, bool z_calibrated) {
+    const GlobalSearchResult r = computeGlobalSearch(
+        scan, base_z, prev_T, has_prev, z_bias, z_calibrated);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (r.accepted) {
+        T_map_odom_ = r.best_T;
+        localized_ = true;
+        global_search_pending_ = false;
+        fail_count_ = 0;
+        last_score_ = r.best_score;
+        last_mean_dist_ = r.mean_dist;
+      } else {
+        // 保持上一次 map->odom，稍后重试（主定时器会再次发起后台搜索）。
+        localized_ = false;
+        global_search_pending_ = true;
+      }
+    }
+    // 必须先释放 mutex_ 再置 false：定时器看到 false 后可能会 join 本线程。
+    search_running_ = false;
   }
 
   bool runIcp(const CloudT::Ptr& source, const Eigen::Matrix4f& initial,
@@ -774,6 +1049,9 @@ class RelocalizationNode : public rclcpp::Node {
   int global_search_top_k_ = 8;
   int global_search_max_points_ = 200;
   double global_search_height_ = 0.35;
+  double max_relocalize_mean_dist_ = 0.30;
+  double max_relocalize_jump_ = 2.0;
+  double strict_relocalize_score_ = 0.85;
 
   bool constrain_planar_ = true;
   bool relocalize_on_start_ = true;
@@ -788,6 +1066,13 @@ class RelocalizationNode : public rclcpp::Node {
   bool map_tree_ready_ = false;
   PointT map_min_;
   PointT map_max_;
+  // 先验地图点云 z 的中位数，用于估计 map->odom 的 z（见 estimateZShift）。
+  float map_z_median_ = 0.0f;
+  bool map_z_median_ready_ = false;
+  // z 分布中位数估计的系统偏差（地图与单帧点云的分布形状不同所致），
+  // 由跟踪成功帧校准后扣除；未校准前按 0 处理。
+  float z_median_bias_ = 0.0f;
+  bool z_median_calibrated_ = false;
 
   // 地图最高点以下 global_search_height_ 内的“上部结构”子图，
   // 只用于全局搜索评分（不再包含地面/墙脚这些对 (x,y,yaw) 无信息量的点）。
@@ -814,6 +1099,10 @@ class RelocalizationNode : public rclcpp::Node {
 
   std::vector<int> nn_indices_{0};
   std::vector<float> nn_distances_{0.0f};
+
+  // 全局搜索后台线程（见 timerCallback 的说明）。
+  std::thread search_thread_;
+  std::atomic<bool> search_running_{false};
 
   // ---------------- ROS 接口 ----------------
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
