@@ -177,45 +177,89 @@ local_costmap:
       global_frame: odom
       robot_base_frame: base_link
       rolling_window: true
-      width: 3
-      height: 3
+      # 【改动】3×3 -> 4×4：原来局部代价地图只有车周围 1.5 m，拖进来的障碍物
+      # 进入 1.5 m 才开始避障，配合 MPPI 的预测时域往往来不及。4×4 给到 2 m。
+      # 注意：局部代价地图再大也没用，超出这张图范围的障碍物仍然不会显示，
+      # 远处障碍物由 global_costmap 的 obstacle_layer 负责（见下面 15 m）。
+      width: 4
+      height: 4
       resolution: 0.05
       # 【改动】新 CAD 模型外形约 1.05 m(长) x 0.74 m(宽，含驱动轮)，base_link 在车体中心。
       # 旧值 0.42 x 0.39 是按小机器人设置的，若继续沿用会让规划器认为可以贴墙太近，
       # 实际车身会撞到障碍；这里按网格包络外扩 1~2 cm。
       footprint: "[ [0.55, 0.38], [0.55, -0.38], [-0.54, -0.38], [-0.54, 0.38] ]"
-      plugins: ["voxel_layer", "inflation_layer"]
+      # 【重要改动】局部代价地图改用普通 ObstacleLayer（2D），不再用 VoxelLayer。
+      # 原因：
+      #   1) /scan 本身就是一平面 2D 扫描，没有任何立体信息，VoxelLayer 的
+      #      z 窗口只会带来“点落在窗口外被静默丢掉”的风险（历史上 origin_z
+      #      与 z_voxels 配错导致局部图长期全 0）；
+      #   2) VoxelLayer 内部用 nav2_voxel_grid，把 z 索引塞进 uint32 的低/高
+      #      16 位，z_voxels 最大 16，设大一点 resize() 直接失败、栅格尺寸为 0，
+      #      局部图同样全 0；
+      #   3) 全局代价地图用的就是 ObstacleLayer，实测标记/清除都正常
+      #      （放一个 0.6 m 箱子：局部非 0 栅格 0 -> 642，删掉后 642 -> 0）。
+      #      ObstacleLayer 只用 min/max_obstacle_height 做高度过滤，没有隐式
+      #      z 窗口，也不会因为 FAST-LIO 的 z 漂移而突然失效。
+      # 如果以后要接真正的 3D 点云做立体避障，再换回 VoxelLayer，并把
+      # z_voxels 控制在 16 以内、origin_z/z_resolution 覆盖实际点云高度。
+      plugins: ["obstacle_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
         inflation_radius: 0.55
-      voxel_layer:
-        plugin: "nav2_costmap_2d::VoxelLayer"
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
-        publish_voxel_map: True
-        origin_z: 0.0
-        z_resolution: 0.05
-        z_voxels: 16
+        # 【关键修正】FAST-LIO 的 odom 系原点在 IMU 起始位姿上（离地约 1.15 m），
+        # base_link 在 odom 系 z ≈ -0.91 ~ -1.16（会漂），/scan 的点也在这一高度。
+        # 默认 min_obstacle_height=0.0 会把它们全部当成“地面以下的非法命中点”
+        # 丢掉，表现为“雷达探测不到障碍物、完全无法避障”。必须给负值；
+        # max_obstacle_height=2.0 保证 1.4 m 高的箱子、墙都在范围内。
+        min_obstacle_height: -2.0
         max_obstacle_height: 2.0
-        mark_threshold: 0
-        observation_sources: scan
+        # 【关键】为什么加第二个观测源 cloud：
+        # /scan 是 360 束点云投影出来的，30° 前倾后绝大部分回波打到地面又被
+        # 高度过滤掉，只剩 120 多束有效回波；障碍物拖走后，没有被任何射线
+        # 穿过的栅格就永远清不掉 —— 表现就是“障碍物移开了，代价地图上的
+        # 障碍包络一直留着”。FAST-LIO 的 /cloud_registered 每帧上千点、覆盖
+        # 整个前方，用它做稠密射线清除，实测 4 s 内就能把包络清干净。
+        # 顺序：scan 先标（可靠），cloud 再补标 + 密集清除。
+        observation_sources: scan cloud
         scan:
-          # A relative topic will be appended to the parent of the local_costmap namespace.
-          # For example:
-          #   * User chosen namespace is `tb4`.
-          #   * User chosen topic is `scan`.
-          #   * Topic will be remapped to `/tb4/scan` without `local_costmap`.
-          #   * Use global topic `/scan` if you do not wish the node namespace to apply
-          # 【修正】相对名 `scan` 会被解析成 /<costmap>/scan（0 个发布者），障碍层
-          # 收不到任何激光，局部避障完全失效；必须写绝对话题 /scan。
+          # 【修正】相对名 `scan` 会被解析成 /<costmap>/scan（0 个发布者），
+          # 障碍层收不到任何激光，局部避障完全失效；必须写绝对话题 /scan。
           topic: /scan
+          # 源代码里的 min_obstacle_height 会覆盖层级的同名参数，
+          # 这里显式给负值，否则点（odom z≈-0.9~-1.2）全部被滤掉。
+          min_obstacle_height: -2.0
           max_obstacle_height: 2.0
           clearing: True
           marking: True
           data_type: "LaserScan"
-          raytrace_max_range: 3.0
+          # raytrace_max_range 必须 ≥ obstacle_max_range：超过 raytrace 距离的
+          # 回波会被整条跳过（不是截断），那条射线就不参与清除，被标记的栅格
+          # 只能等别的射线来清。局部地图只有 4×4 m，取 10 m 足以清空整个窗口。
+          raytrace_max_range: 10.0
           raytrace_min_range: 0.0
-          obstacle_max_range: 2.5
+          obstacle_max_range: 10.0
+          obstacle_min_range: 0.0
+        cloud:
+          topic: /cloud_registered
+          data_type: "PointCloud2"
+          # 标记和清除都打开：点云比 /scan 密，一起标记能补上 2D 投影漏掉的
+          # 障碍物；同时它自己的标记和清除互相自洽，不会出现“刚标上就被
+          # 同一次更新清掉”的情况。
+          marking: True
+          clearing: True
+          # 地面点在 odom 系 z ≈ -1.14，base_link 在 -0.97，障碍物都在
+          # -0.9 以上。下限取 -0.85 把地面滤掉（否则整片地面会被标成障碍），
+          # 留 0.3 m 余量吸收 FAST-LIO 的高度漂移。
+          min_obstacle_height: -0.85
+          max_obstacle_height: 2.0
+          # 局部窗口只有 4×4 m，6 m 足够覆盖；再远只会白白扫栅格。
+          raytrace_max_range: 6.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 6.0
           obstacle_min_range: 0.0
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
@@ -239,7 +283,13 @@ global_costmap:
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
-        observation_sources: scan
+        # 【关键修正】与 local_costmap 同一个问题：map 系原点也在 IMU 起始位姿，
+        # /scan 的点在 map 系 z ≈ -0.91，默认 min_obstacle_height=0.0 会把它们
+        # 全部当作“地面以下的非法命中点”丢掉，全局障碍层永远收不到障碍物。
+        min_obstacle_height: -2.0
+        max_obstacle_height: 2.0
+        # 与 local_costmap 同一套分工：scan 负责标记，cloud 负责稠密清除。
+        observation_sources: scan cloud
         scan:
           # A relative topic will be appended to the parent of the global_costmap namespace.
           # For example:
@@ -250,13 +300,37 @@ global_costmap:
           # 【修正】相对名 `scan` 会被解析成 /<costmap>/scan（0 个发布者），障碍层
           # 收不到任何激光，局部避障完全失效；必须写绝对话题 /scan。
           topic: /scan
+          # 【新增】同上：/scan 的点在 map 系 z ≈ -0.91，默认 0.0 会被全部滤掉。
+          min_obstacle_height: -2.0
           max_obstacle_height: 2.0
           clearing: True
           marking: True
           data_type: "LaserScan"
-          raytrace_max_range: 3.0
+          # 【改动】2.5/3.0 -> 15.0/15.0：雷达前倾 30° 后，回波大多落在 4~15 m
+          # （地面/墙），原来的 2.5 m 几乎什么都标不上，规划器看不到拖进来的
+          # 障碍物。这里放到雷达量程上限 15 m，标记范围与清除范围一致：
+          # 凡是能被标上的回波，都能被同一条射线清掉，不会留下幽灵障碍。
+          raytrace_max_range: 15.0
           raytrace_min_range: 0.0
-          obstacle_max_range: 2.5
+          obstacle_max_range: 15.0
+          obstacle_min_range: 0.0
+        cloud:
+          # FAST-LIO 配准后的稠密世界点云（odom 系，10 Hz，约 1 千点/帧）。
+          # 只做清除：把障碍物拖走后残留的障碍栅格连同膨胀包络一起扫掉。
+          topic: /cloud_registered
+          data_type: "PointCloud2"
+          marking: True
+          clearing: True
+          # 地面点（map 系 z ≈ -1.14）必须滤掉，否则整片地面被标成障碍。
+          min_obstacle_height: -0.85
+          max_obstacle_height: 2.0
+          # 【关键】全局地图是 21×21 m，点云每帧都整幅扫描会让单次更新超过
+          # update_frequency 周期，缓冲区越积越多（实测滞后 25 s 还在涨）。
+          # 只清机器人周围 6 m —— 幽灵障碍只在机器人附近影响规划，
+          # 远处的残留由 /scan 自己的射线清。
+          raytrace_max_range: 6.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 6.0
           obstacle_min_range: 0.0
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"

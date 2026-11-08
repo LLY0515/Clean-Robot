@@ -2,10 +2,11 @@
 # ============================================================
 #  一键键盘建图脚本（重新生成地图）
 #
-#  流程：Gazebo 仿真 + FAST-LIO 里程计 + slam_toolbox 在线建图
+#  流程：Gazebo 仿真 + FAST-LIO 里程计 + 在线建图（RTAB-Map 或 slam_toolbox）
 #        + 键盘遥控，边开边建；按 Ctrl+C 结束驾驶后自动保存地图。
 #
 #  用法：./build_map.sh [地图名]      （地图名默认 my_map，会覆盖原图）
+#        SLAM_ALGO=slam_toolbox ./build_map.sh   切回 slam_toolbox
 #  输出：src/sam_bot_description/map/<地图名>.yaml / .pgm
 # ============================================================
 
@@ -16,6 +17,27 @@ cd "$(dirname "$0")"
 MAP_NAME="${1:-my_map}"                              # 保存的地图名
 MAP_DIR="$(pwd)/src/sam_bot_description/map"         # 保存目录
 SLAM_PARAMS="$(pwd)/src/sam_bot_description/config/mapper_params_online_async.yaml"
+# 【改动】建图算法可切换：rtabmap（默认）| slam_toolbox
+#   用环境变量覆盖：SLAM_ALGO=slam_toolbox ./build_map.sh
+SLAM_ALGO="${SLAM_ALGO:-rtabmap}"
+# 保存地图时读取的话题（两种算法都发 /map）
+MAP_TOPIC="${MAP_TOPIC:-/map}"
+# RTAB-Map 数据库：每趟建图都从零开始，否则会接着上一趟的图继续
+RTABMAP_DB="/tmp/rtabmap_${MAP_NAME}.db"
+# 【改动】建图专用 FAST-LIO 配置：点云密度比导航默认高一档
+# （每帧全部点、0.2 m 体素）。仿真雷达每帧只有 2500 条射线，导航默认配置
+# 又每 3 点取 1 + 0.5 m 体素，里程计实测漂 1.6%（16.7 m 走 0.22 m）；
+# 用这份配置后同样路线误差降到 0.06~0.12 m，重影明显减轻。
+FASTLIO_CONFIG="$(pwd)/src/fast_lio/config/mid360_sim_2dmap.yaml"
+# 【改动】话题就绪探针：用 rclpy 订阅，不用 `ros2 topic echo`
+# （本机 ros2cli 守护进程异常，echo 有数据也会报 "!rclpy.ok()" 返回非 0，
+#   导致脚本误判"60 秒内 /scan 仍无数据"）
+TOPIC_PROBE="$(pwd)/src/sam_bot_description/tools/topic_ready.py"
+# 【改动】存图改用自带的 save_map.py，不用 nav2 的 map_saver_cli。
+# map_saver_cli 只等 2 秒（save_map_timeout），而 slam_toolbox 每 5 秒才发一次
+# /map、rtabmap 只在图变化时才发，机器人一停就容易错过 → 报
+# "Failed to spin map subscription" 并存不出图（实测 5 次里坏 3 次）。
+SAVE_TOOL="$(pwd)/src/sam_bot_description/tools/save_map.py"
 AUTOSAVE_SEC=20                                      # 后台自动保存间隔（秒）
 
 # ---------- 清理残留进程 ----------
@@ -31,43 +53,58 @@ if [ ! -f install/setup.bash ]; then
 fi
 source install/setup.bash
 
-# 本机（VMware 虚拟显卡 + Qt GTK 主题）需要的环境变量，否则 rviz2 崩溃
-export GSETTINGS_SCHEMA_DIR=/home/rostwo/.local/share/glib-2.0/schemas
+# 建图算法可用性检查
+if [ "$SLAM_ALGO" = "rtabmap" ] && ! ros2 pkg prefix rtabmap_ros >/dev/null 2>&1; then
+  echo "✗ 选择了 RTAB-Map，但系统里没有 rtabmap_ros。"
+  echo "  安装：sudo apt install -y ros-humble-rtabmap-ros"
+  echo "  或切回旧算法：SLAM_ALGO=slam_toolbox ./build_map.sh"
+  exit 1
+fi
+
+# 本机（虚拟显卡 + Qt GTK 主题）需要的环境变量，否则 rviz2 崩溃
+# 【改动】原路径硬编码为 /home/rostwo，本机不存在该目录；指向不存在的
+# GSETTINGS_SCHEMA_DIR 会让 GTK 找不到系统 schema，反而更容易崩。
+if [ -d "$HOME/.local/share/glib-2.0/schemas" ]; then
+  export GSETTINGS_SCHEMA_DIR="$HOME/.local/share/glib-2.0/schemas"
+fi
 export QT_QPA_PLATFORM=xcb
+# 【改动】与 run.sh 一致：让 Gazebo/RViz 用独显渲染，否则默认落到 Intel 核显。
+export MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA
 
 # ---------- 后台进程用 setsid 隔离到独立会话，避免 Ctrl+C 把它们一起杀掉 ----------
 echo "[1/4] 启动 Gazebo 仿真 + FAST-LIO + 点云转扫描 + RViz（后台）..."
 setsid ros2 launch sam_bot_description display.launch.py gui:=False \
+  fastlio_config:="$FASTLIO_CONFIG" \
   > /tmp/build_map_sim.log 2>&1 < /dev/null &
 
 echo "[2/4] 等待激光 /scan 有数据 ..."
-READY=0
-for _ in $(seq 1 60); do
-  if timeout 3 ros2 topic echo /scan --once --qos-reliability best_effort >/dev/null 2>&1; then
-    READY=1; break
-  fi
-  sleep 1
-done
-if [ "$READY" != "1" ]; then
-  echo "✗ 60 秒内 /scan 仍无数据，请查看日志：/tmp/build_map_sim.log"
+if ! python3 "$TOPIC_PROBE" /scan --timeout 90 --best-effort; then
+  echo "✗ 90 秒内 /scan 仍无数据，请查看日志：/tmp/build_map_sim.log"
   exit 1
 fi
+echo "      ✓ /scan 已开始发布"
 
-echo "[3/4] 启动 slam_toolbox 在线建图（后台）..."
-setsid ros2 launch slam_toolbox online_async_launch.py \
-  slam_params_file:="$SLAM_PARAMS" \
-  > /tmp/build_map_slam.log 2>&1 < /dev/null &
+# 记下本次拉起的 gzserver PID：后台自动保存只在它活着时才写文件，
+# 避免仿真被外部杀掉后，把别的进程发布的 /map 覆盖到正式地图上。
+SIM_PID="$(pgrep -n -f 'gzserver .*my_carpark' 2>/dev/null || true)"
 
-# 等 SLAM 完成初始化并发出第一张 /map
+if [ "$SLAM_ALGO" = "rtabmap" ]; then
+  echo "[3/4] 启动 RTAB-Map 在线建图（后台）..."
+  rm -f "$RTABMAP_DB"
+  setsid ros2 launch sam_bot_description rtabmap_mapping.launch.py \
+    database_path:="$RTABMAP_DB" \
+    > /tmp/build_map_slam.log 2>&1 < /dev/null &
+else
+  echo "[3/4] 启动 slam_toolbox 在线建图（后台）..."
+  setsid ros2 launch slam_toolbox online_async_launch.py \
+    slam_params_file:="$SLAM_PARAMS" \
+    > /tmp/build_map_slam.log 2>&1 < /dev/null &
+fi
+
+# 等 SLAM 完成初始化并发出第一张 /map（slam_toolbox 的 map_update_interval=5 s，
+# RTAB-Map 拿到第一帧扫描后立即发；给 30 s 足够）
 echo "      等待 /map 生成 ..."
-MAP_READY=0
-for _ in $(seq 1 30); do
-  if timeout 3 ros2 topic echo /map --once >/dev/null 2>&1; then
-    MAP_READY=1; break
-  fi
-  sleep 1
-done
-if [ "$MAP_READY" = "1" ]; then
+if python3 "$TOPIC_PROBE" "$MAP_TOPIC" --timeout 30; then
   echo "      ✓ /map 已开始发布"
 else
   echo "      ! 暂未收到 /map（继续运行，保存时再检查）"
@@ -85,10 +122,7 @@ save_map() {
   mkdir -p "$MAP_DIR"
   echo ""
   echo ">>> 保存地图到 $MAP_DIR/$MAP_NAME ..."
-  # 注意：map_saver_cli 的 -t 是"地图话题名"不是超时；收不到 /map 会一直等，
-  # 所以外面套 timeout 兜底。
-  timeout 60 ros2 run nav2_map_server map_saver_cli \
-      -f "$MAP_DIR/$MAP_NAME" -t /map --ros-args -p use_sim_time:=True
+  timeout 90 python3 "$SAVE_TOOL" "$MAP_DIR/$MAP_NAME" --topic "$MAP_TOPIC"
   local rc=$?
 
   if [ -f "$MAP_DIR/$MAP_NAME.yaml" ] && [ -f "$MAP_DIR/$MAP_NAME.pgm" ]; then
@@ -108,8 +142,15 @@ autosave_loop() {
   while true; do
     sleep "$AUTOSAVE_SEC"
     [ "$SAVED" = "1" ] && break
-    timeout 30 ros2 run nav2_map_server map_saver_cli \
-      -f "$MAP_DIR/$MAP_NAME" -t /map --ros-args -p use_sim_time:=True >/dev/null 2>&1
+    # 【防护】本次脚本的 gzserver 已经退出 → 停止自动保存。
+    # 否则会把这个进程之外、其它仿真/测试节点发布的 /map 写进正式地图文件。
+    if [ -n "$SIM_PID" ] && ! kill -0 "$SIM_PID" 2>/dev/null; then
+      echo ""
+      echo ">>> ! 仿真进程已退出，停止后台自动保存（地图不再更新）"
+      break
+    fi
+    timeout 60 python3 "$SAVE_TOOL" "$MAP_DIR/$MAP_NAME" --topic "$MAP_TOPIC" \
+      --timeout 10 --settle 1 >/dev/null 2>&1
   done
 }
 
@@ -120,7 +161,7 @@ cleanup() {
   CLEANED=1
   kill "$AUTOSAVE_PID" 2>/dev/null || true
   echo ">>> 关闭后台仿真/建图进程 ..."
-  pkill -9 -f "gzserver|gzclient|robot_state_publisher|fastlio_mapping|pointcloud_to_laserscan|slam_toolbox|rviz2|joint_state_publisher|spawn_entity" 2>/dev/null || true
+  pkill -9 -f "gzserver|gzclient|robot_state_publisher|fastlio_mapping|pointcloud_to_laserscan|slam_toolbox|rtabmap|rviz2|joint_state_publisher|spawn_entity" 2>/dev/null || true
   echo ">>> 完成。"
 }
 

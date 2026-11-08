@@ -1,0 +1,83 @@
+# ============================================================================
+#  FAST-LIO 参数 —— 2D 栅格建图专用（build_map.sh）
+#
+#  与 mid360_sim.yaml（导航默认）的区别只有"点云密度"这四项：
+#    point_filter_num 3 -> 1    ：每帧 2500 个仿真点全部参与配准
+#    filter_size_surf 0.5 -> 0.2 ：降采样体素更细，墙面特征保留更多
+#    filter_size_map  0.5 -> 0.2 ：内部地图体素更细
+#    max_iteration    3 -> 4     ：多迭代一次，收敛更充分
+#
+#  为什么：仿真插件每帧只打 2500 条射线（真实 Mid-360 约 2 万点/100 ms），
+#  导航默认配置又在 FAST-LIO 里"每 3 点取 1 + 0.5 m 体素"，实际每帧只剩
+#  ~800 个点。稀疏点云下 ICP 约束弱，实测方形路线 16.7 m 的里程计漂移
+#  中位 0.225 m（1.6% 航程）；改用本配置后同样路线（前 11 m）误差降到
+#  0.06~0.12 m。里程计漂移小，slam_toolbox 的修正跳变也随之变小，
+#  "地图轮廓叠轮廓"的重影明显减轻。
+#
+#  注意：建 3D 先验地图用的是 mid360_sim_mapping.yaml（它还多一个
+#  pcd_save_en:=true，用于 /map_save 存 PCD），两者不要混用。
+# ============================================================================
+/**:
+    ros__parameters:
+        feature_extract_enable: false
+        point_filter_num: 1          # 【建图】3 -> 1：用全部点
+        max_iteration: 4             # 【建图】3 -> 4
+        filter_size_surf: 0.2        # 【建图】0.5 -> 0.2
+        filter_size_map: 0.2         # 【建图】0.5 -> 0.2
+        cube_side_length: 1000.0
+        runtime_pos_log_enable: false
+        map_file_path: "./test.pcd"
+
+        common:
+            lid_topic:  "/livox/lidar"
+            imu_topic:  "/livox/imu"
+            time_sync_en: false
+            time_offset_lidar_to_imu: 0.0
+
+        preprocess:
+            lidar_type: 4                # 4 = 通用 PointCloud2 输入
+            scan_line:  4
+            blind: 0.5
+            timestamp_unit: 3
+            # 仿真点云是瞬时快照，没有 100ms 扫描过程；scan_rate=10 会让 mid360_handler
+            # 把整帧判成横跨 99.7ms，导致 lidar_end_time 晚 0.1s、姿态时间戳整体后移。
+            # 调到 1000 使跨度≈1ms。真机请改回 10。详见 mid360_sim.yaml 中的完整说明。
+            scan_rate: 1000
+
+        mapping:
+            acc_cov: 0.1
+            # 仿真 IMU 陀螺噪声 stddev 只有 1e-5 rad/s，gyr_cov 保持与
+            # mid360_sim.yaml 一致的 0.01（原默认 0.1 会让纯旋转时 yaw 低估）。
+            gyr_cov: 0.01
+            b_acc_cov: 0.0001
+            b_gyr_cov: 0.0001
+            fov_degree:    360.0
+            det_range:     100.0
+            extrinsic_est_en:  false
+            # 雷达 30° 斜装：lidar->IMU 的旋转为 Ry(+30°)，
+            # T = -Ry(30°)·t_imu = (0.0125337, -0.02329, 0.0437090)
+            extrinsic_T: [ 0.0125337, -0.02329, 0.0437090 ]
+            extrinsic_R: [ 0.8660254, 0., 0.5,
+                            0., 1., 0.,
+                           -0.5, 0., 0.8660254 ]
+            # IMU(机体)在物理 base_link 系中的安装位姿（由 URDF 链合成）。
+            #   t = (0.346,0,0.93) + Ry(30°)·(0.011,0.02329,-0.04412)
+            #     = (0.3334663, 0.02329, 0.886291)
+            # FAST-LIO 内部状态是 IMU 位姿，发布 odom->base_link 时右乘该外参的逆，
+            # 让车模/足迹落在真实车体上。
+            body_to_base_T: [0.3334663, 0.02329, 0.886291]
+            body_to_base_R: [1., 0., 0.,
+                             0., 1., 0.,
+                             0., 0., 1.]
+
+        publish:
+            path_en: true
+            effect_map_en: false
+            map_en: true
+            scan_publish_en:  true
+            dense_publish_en: true
+            scan_bodyframe_pub_en: true
+
+        pcd_save:
+            pcd_save_en: false           # 2D 建图不需要存 PCD
+            interval: -1

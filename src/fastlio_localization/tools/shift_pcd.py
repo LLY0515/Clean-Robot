@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """把 PCD 的 x/y/z 整体平移（默认原地写回）。
 
-用途：FAST-LIO 保存的 PCD 在 odom 系，原点是建图起点的 **IMU**；而 2D 栅格地图
-（my_map.pgm）的原点是建图起点的 **base_link**（世界原点）。两者相差 IMU 的安装
-偏移 t = (0.3335, 0.0233, 0.8863) m（见 URDF base_link→livox→livox_imu）。
+【2026-11-04 更正：默认平移已停用，请勿再对 prior_3d_map.pcd 调用】
+FAST-LIO 保存的 PCD 在 odom 系，原点是建图起点的 IMU 位姿。slam_toolbox 建 2D
+栅格地图时 map->odom 初始为恒等变换，因此 2D 地图（my_map.pgm）的 map 系原点
+**同样是**建图起点的 IMU，而不是 base_link。实测建图刚启动时
+map->base_link = (-0.339, -0.028)，正好是 IMU 安装偏移的负值。
 
-不平移的话，3D 重定位输出的 map 系与 2D 静态地图相差 0.33 m，Nav2 的 static_layer
-和实际障碍物对不上，会出现“RViz 里没撞、Gazebo 里撞了”。
-
-这里只平移 x/y：z 保持 FAST-LIO 的雷达平面为 0，重定位节点的 constrain_planar
-会把 map->odom 的 z 约束为 0，平移 z 反而会破坏 ICP 的竖向对齐。
+所以先验 PCD 保持 odom 系即可；再叠加 (0.3335, 0.0233) 会让重定位输出的
+map->odom 多出同样的偏移，导航时 RViz 里的机器人比 Gazebo 中凭空靠近障碍物
+0.33 m（实测 map->base_link 为 (0.012, -0.016)，真值为 (-0.305, -0.022)）。
+build_3d_map.sh 已不再调用本脚本；保留它只是为了需要时手工平移调试。
 
 用法：
-    python3 shift_pcd.py prior_3d_map.pcd                 # 用默认偏移，原地更新
     python3 shift_pcd.py in.pcd -o out.pcd --xy 0.33 0.02
     python3 shift_pcd.py in.pcd --z 0.0
 """
@@ -22,6 +22,8 @@ import sys
 import numpy as np
 
 # 与 fast_lio/config/mid360_sim*.yaml 的 mapping.body_to_base_T 保持一致
+# （雷达 30° 斜装：t = (0.346,0,0.93) + Ry(30°)·(0.011,0.02329,-0.04412)
+#                       = (0.3334663, 0.02329, 0.886291)）
 DEFAULT_XY = (0.3334663, 0.02329)
 
 

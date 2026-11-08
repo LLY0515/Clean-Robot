@@ -31,7 +31,10 @@
             scan_line:  4
             blind: 0.5
             timestamp_unit: 3
-            scan_rate: 10
+            # 仿真点云是瞬时快照，没有 100ms 扫描过程；scan_rate=10 会让 mid360_handler
+            # 把整帧判成横跨 99.7ms，导致 lidar_end_time 晚 0.1s、姿态时间戳整体后移。
+            # 调到 1000 使跨度≈1ms。真机请改回 10。详见 mid360_sim.yaml 中的完整说明。
+            scan_rate: 1000
 
         mapping:
             acc_cov: 0.1
@@ -41,6 +44,8 @@
             fov_degree:    360.0
             det_range:     100.0
             extrinsic_est_en:  false
+            # 与 mid360_sim.yaml 一致：雷达 30° 斜装，lidar->IMU 为 Ry(+30°)，
+            # T = -Ry(30°)·t_imu = (0.0125337, -0.02329, 0.0437090)
             extrinsic_T: [ 0.0125337, -0.02329, 0.0437090 ]
             extrinsic_R: [ 0.8660254, 0., 0.5,
                             0., 1., 0.,

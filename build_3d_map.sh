@@ -11,8 +11,9 @@
 #
 #  输出：src/sam_bot_description/map/prior_3d_map.pcd
 #
-#  用法：./build_3d_map.sh
-#        ./build_3d_map.sh /path/to/other.pcd
+#  用法：./build_3d_map.sh                  # 默认键盘遥控（当前场景 my_carpark 约 20×20 m）
+#        ./build_3d_map.sh --auto            # 小场景：固定小方环自动行驶
+#        ./build_3d_map.sh [--manual|--auto] /path/to/other.pcd
 # ============================================================================
 
 set -e
@@ -20,6 +21,19 @@ set -e
 cd "$(dirname "$0")"
 
 WS="$(pwd)"
+# 【改动】默认改为手动模式：当前场景 my_carpark 约 20×20 m，有内部隔墙和
+# 两辆车，auto_drive_map.py 的 1.1 m 小方环采不到几米外的墙面，
+# 所以默认用键盘遥控（teleop_twist_keyboard），Ctrl+C 结束遥控后自动存图。
+#   ./build_3d_map.sh            # 键盘遥控（默认）
+#   ./build_3d_map.sh --auto     # 小场景自动小方环
+MANUAL=1
+if [ "${1:-}" = "--manual" ]; then
+  MANUAL=1
+  shift
+elif [ "${1:-}" = "--auto" ]; then
+  MANUAL=0
+  shift
+fi
 MAP_OUT="${1:-$WS/src/sam_bot_description/map/prior_3d_map.pcd}"
 MAPPING_CONFIG="$WS/src/fast_lio/config/mid360_sim_mapping.yaml"
 AUTO_DRIVE="$WS/src/fastlio_localization/tools/auto_drive_map.py"
@@ -47,6 +61,8 @@ if [ -d "$HOME/.local/share/glib-2.0/schemas" ]; then
   export GSETTINGS_SCHEMA_DIR="$HOME/.local/share/glib-2.0/schemas"
 fi
 export QT_QPA_PLATFORM=xcb
+# 【改动】与 run.sh 一致：让 Gazebo 用独显渲染，否则默认落到 Intel 核显。
+export MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA
 
 if [ ! -f "$AUTO_DRIVE" ]; then
   echo "✗ 找不到自动行驶脚本：$AUTO_DRIVE"
@@ -59,7 +75,7 @@ rm -f "$MAP_OUT"
 # ---------- 启动仿真（mapping 配置） ----------
 echo "[1/4] 启动 Gazebo + FAST-LIO（mapping 配置，无 RViz）..."
 setsid ros2 launch sam_bot_description display.launch.py \
-  gui:=False rviz:=False \
+  gui:=True rviz:=False \
   fastlio_config:="$MAPPING_CONFIG" \
   fastlio_map_file:="$MAP_OUT" \
   > "$SIM_LOG" 2>&1 < /dev/null &
@@ -87,9 +103,22 @@ fi
 # FAST-LIO 刚初始化时机器人可能还在微落/回弹，等它稳定。
 sleep 4
 
-# ---------- 自动行驶 ----------
-echo "[3/4] 自动行驶采集点云（约 45 秒）..."
-python3 "$AUTO_DRIVE"
+# ---------- 采集点云 ----------
+if [ "$MANUAL" = "1" ]; then
+  # 【改动】手动遥控：Ctrl+C 结束遥控（SIGINT 也会送到本脚本，用 trap 吃掉，
+  # 继续执行后面的 /map_save）。建议把整个场景走一遍，越全重定位越稳。
+  echo "[3/4] 手动遥控采集点云：用键盘把车开遍场景，完成后按 Ctrl+C 结束遥控并保存。"
+  trap 'true' INT
+  ros2 run teleop_twist_keyboard teleop_twist_keyboard || true
+  trap - INT
+  # 遥控退出后差速插件会保持最后一条速度指令，这里明确发一次 0 让车停住。
+  timeout 5 ros2 topic pub --once /cmd_vel geometry_msgs/msg/Twist \
+    "{linear: {x: 0.0}, angular: {z: 0.0}}" > /dev/null 2>&1 || true
+  sleep 1
+else
+  echo "[3/4] 自动行驶采集点云（约 45 秒；小方环只适合小场景）..."
+  python3 "$AUTO_DRIVE"
+fi
 
 # ---------- 保存 PCD ----------
 echo "[4/4] 调用 /map_save 保存 PCD ..."
@@ -99,15 +128,17 @@ fi
 
 sleep 1
 
-# FAST-LIO 保存的是 odom(IMU 起点)系点云，原点在 IMU；2D 栅格地图的原点在
-# base_link（世界原点），两者相差 IMU 安装偏移 (0.3335, 0.0233) m。这里把 PCD 的
-# x/y 平移过去，保证 3D 重定位的 map 系与 map_server 的 2D 地图一致。
-# 注意：只平移 x/y，z 保持雷达平面为 0（重定位的 constrain_planar 会把
-# map->odom 的 z 约束为 0）。脚本每次都会先删除旧 PCD，不会重复平移。
+# 【重要·不要再平移 PCD】
+# FAST-LIO 保存的点云在 odom 系，原点 = 建图起点的 IMU 位姿；
+# slam_toolbox 建的 2D 栅格地图同样在 map 系，而 map->odom 初始为恒等变换，
+# 所以 map 系原点**也是**建图起点的 IMU（实测 map->base_link 在出生点就是
+# (-0.339, -0.028)，正好是 IMU 安装偏移的负值），并不是 base_link。
+# 因此先验 PCD 保持 odom 系即可，任何 xy 平移都会让 map->odom 多出同样的
+# 偏移，导航时 RViz 里的机器人会比 Gazebo 中"更靠近"前方障碍物（实测多 0.33 m）。
+# 旧的 shift_pcd.py（+0.3335, +0.0233）是在"2D 地图原点是 base_link"的错误
+# 前提下加的，已停用；脚本每次都会先删旧 PCD，重新生成即可。
 if [ -s "$MAP_OUT" ]; then
-  echo ">>> 平移 PCD 到 base_link 起点坐标系（与 2D 地图对齐）..."
-  python3 "$WS/src/fastlio_localization/tools/shift_pcd.py" "$MAP_OUT" || \
-    echo "⚠️  PCD 平移失败，3D 重定位与 2D 地图可能相差 0.33 m"
+  echo ">>> PCD 保持 FAST-LIO odom 系（与 slam_toolbox 的 map 系一致，无需平移）"
 fi
 
 if [ -s "$MAP_OUT" ]; then

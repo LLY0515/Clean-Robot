@@ -91,7 +91,7 @@
       <visual>
         <origin xyz="0 0 -0.045" rpy="0 0 0"/>
         <geometry>
-          <mesh filename="$(find mid360_simulation)/meshes/livox_frame.STL"/>
+          <mesh filename="file://$(find mid360_simulation)/meshes/livox_frame.STL"/>
         </geometry>
         <material name="livox_dark_grey">
           <color rgba="0.3 0.3 0.3 1"/>
@@ -102,7 +102,7 @@
       <collision>
         <origin xyz="-0.011 -0.02329 -0.005" rpy="0 0 0"/>
         <geometry>
-          <mesh filename="$(find mid360_simulation)/meshes/livox_frame.STL"/>
+          <mesh filename="file://$(find mid360_simulation)/meshes/livox_frame.STL"/>
         </geometry>
       </collision>
     </link>

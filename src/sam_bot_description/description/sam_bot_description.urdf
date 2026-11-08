@@ -53,7 +53,7 @@
     <visual name="visual_0">
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="$(find sam_bot_description)/meshes/visual/base_link.STL" />
+        <mesh filename="file://$(find sam_bot_description)/meshes/visual/base_link.STL" />
       </geometry>
       <material name="chassis_grey">
         <color rgba="0.82352999999999998 0.82352999999999998 1 1" />
@@ -97,7 +97,7 @@
     <visual name="visual_0">
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="$(find sam_bot_description)/meshes/visual/new_link.STL" />
+        <mesh filename="file://$(find sam_bot_description)/meshes/visual/new_link.STL" />
       </geometry>
       <material name="white">
         <color rgba="1 1 1 1" />
@@ -131,7 +131,7 @@
     <visual name="visual_0">
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="$(find sam_bot_description)/meshes/visual/new_link_1.STL" />
+        <mesh filename="file://$(find sam_bot_description)/meshes/visual/new_link_1.STL" />
       </geometry>
       <material name="white">
         <color rgba="1 1 1 1" />
@@ -166,7 +166,7 @@
     <visual name="visual_0">
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="$(find sam_bot_description)/meshes/visual/new_link_2.STL" />
+        <mesh filename="file://$(find sam_bot_description)/meshes/visual/new_link_2.STL" />
       </geometry>
       <material name="white">
         <color rgba="1 1 1 1" />
@@ -198,7 +198,7 @@
     <visual name="visual_0">
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="$(find sam_bot_description)/meshes/visual/new_link_3.STL" />
+        <mesh filename="file://$(find sam_bot_description)/meshes/visual/new_link_3.STL" />
       </geometry>
       <material name="white">
         <color rgba="1 1 1 1" />
@@ -230,7 +230,7 @@
     <visual name="visual_0">
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="$(find sam_bot_description)/meshes/visual/new_link_4.STL" />
+        <mesh filename="file://$(find sam_bot_description)/meshes/visual/new_link_4.STL" />
       </geometry>
       <material name="white">
         <color rgba="1 1 1 1" />
@@ -262,7 +262,7 @@
     <visual name="visual_0">
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="$(find sam_bot_description)/meshes/visual/new_link_5.STL" />
+        <mesh filename="file://$(find sam_bot_description)/meshes/visual/new_link_5.STL" />
       </geometry>
       <material name="white">
         <color rgba="1 1 1 1" />
@@ -364,28 +364,20 @@
           base_link.STL 中删除，只保留 z=0.80~0.84 的安装底座板。这里改用
           mid360.xacro 的仿真雷达替换，安装位置与角度都和原 CAD 雷达一致：
           CAD 坐标 (x≈0.0008, y≈0.3235) → base_link (0.3235, 0, ...)。
-          实测 CAD 网格里雷达装在一个 30° 斜面上（斜面法向量 (0, ±0.5, ±0.866)，
-          绕车体横向轴前倾），即雷达本体朝前进方向前倾 30°。base_link 前进方向
-          是 +x，故 pitch 取 +30°（rpy 的 pitch 项 ${pi/6}）。
-          整个 livox link（可视网格 + 射线传感器）按真实安装角度前倾 30°：
-          宏的可视网格相对 link 原点下沉 0.045 m，倾斜以网格底面为支点。
-          雷达原装位：底面落在底座板 z=0.84、水平中心 x=0.3235；link 原点
-          在 +30° 方向上抬 R·(0,0,0.045)≈(0.0225,0,0.039)。
-          但 30° 前倾后，向下的波束会扫到车头前脸/横杠（碰撞盒 collision_upper
-          前上缘 x≈0.475、z≈0.80），把自身识别成障碍物、遮住前方点云。为此把
-          雷达整体抬高 0.051 m（底面到 z≈0.891），倾斜角不变，让最低波束
-          （水平面下 37.2°）在 x=0.475 处约 z=0.832，已越过车头：
-          xyz = (0.3235+0.0225, 0, 0.84+0.039+0.051) = (0.346, 0, 0.93)。
-          这样雷达点云是真正按 30° 斜装发射的（不只是外观倾斜）。
-          为了不破坏 FAST-LIO：把 IMU 坐标系用 imu_rpy 反向旋转回水平
-          （rpy=(0,-pi/6,0)），即机体/IMU 仍与 base_link 对齐；雷达相对 IMU
-          的 30° 旋转通过 FAST-LIO 的 extrinsic_R/T 精确补偿
-          （extrinsic_R=Ry(30°)，extrinsic_T=[0.012534,-0.02329,0.043708]，
-          只描述雷达↔IMU 相对位姿，抬高后无需改动）。
-          若 IMU 也跟着倾斜且外参不修正，odom→base_link 会发散（实测 pitch
-          漂到 60°），AMCL 失定位。雷达后方/侧方的陡峭向下波束仍会扫到
-          z≈0.80 的车顶，pointcloud_to_laserscan 的 max_height=0.80 能滤掉
-          这些自身回波，同时保留墙面点（墙顶对应 base_link z=0.76）。
+          【当前：倾斜角 30°（按 CAD 斜面安装，本体朝前下方前倾）】
+            livox      rpy = (0, +pi/6, 0)   绕 +y 旋转，光轴指向前下方
+            livox_imu  rpy = (0, -pi/6, 0)   反向旋回水平，IMU 系与 base_link 同向
+            雷达↔IMU 的 30° 旋转交给 FAST-LIO 的 extrinsic_R/T
+          安装位置 xyz=(0.346, 0, 0.93) 与原 CAD 雷达一致。
+          合成后 IMU 在 base_link 中的位姿：
+            t = (0.346,0,0.93) + Ry(30°)·(0.011,0.02329,-0.04412)
+              = (0.3334663, 0.02329, 0.886291)，R = I
+          【代价】倾斜后垂直视场从 −7°~+52° 变成 −37°~+22°，射线大量打在
+          地面：实测 15 m 内 62% 的点落在地面（水平安装只有 5%），仿真每帧
+          只有 2500 条射线（真机 2 万）时 /scan 有效光束降到 153~166/360，
+          2D 建图质量明显下降。
+          若改回水平安装（0°），需要同时改 URDF 的 rpy/imu_rpy、三个 fast_lio
+          配置的 extrinsic_*/body_to_base_*、以及 shift_pcd.py 的 DEFAULT_XY。
        ============================================================ -->
   <xacro:mid360 name="livox" parent="base_link" imu_rpy="0 ${-pi/6} 0">
     <origin xyz="0.346 0 0.93" rpy="0 ${pi/6} 0"/>

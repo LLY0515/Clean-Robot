@@ -25,5 +25,17 @@ if [ -d "$HOME/.local/share/glib-2.0/schemas" ]; then
 fi
 export QT_QPA_PLATFORM=xcb
 
+# 【改动】WSL2 下 Mesa 默认选到 Intel 核显（d3d12 驱动），本机的 RTX 5060 完全闲置。
+# 实测同一窗口尺寸下独显的 GL 吞吐是核显的 2~5 倍，两个 GUI 同时开时差距更大。
+# 没有独显的机器删掉这一行即可（不设则自动选默认适配器）。
+export MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA
+
 # 启动完整导航
+# 【改动】GL 走的是硬件 D3D12（核显或上面指定的独显），不是 llvmpipe 软件渲染；
+# 但 Gazebo + RViz 两个大窗口同时渲染仍然吃紧。
+# 设 HEADLESS=1 ./run.sh 可以只跑 gzserver + RViz，不打开 Gazebo 窗口。
+if [ "${HEADLESS:-0}" = "1" ]; then
+  echo "HEADLESS=1：不启动 Gazebo GUI（rviz 仍会打开）"
+  exec ros2 launch sam_bot_description navigation.launch.py gui:=false
+fi
 exec ros2 launch sam_bot_description navigation.launch.py

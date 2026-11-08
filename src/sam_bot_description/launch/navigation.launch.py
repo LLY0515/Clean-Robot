@@ -3,6 +3,7 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (IncludeLaunchDescription, DeclareLaunchArgument,
                             TimerAction)
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, Command
 from launch_ros.actions import Node
@@ -20,7 +21,10 @@ def generate_launch_description():
     # 你的 URDF 模型路径 (安装后位于 share/<pkg>/description/ 下)
     urdf_file = os.path.join(pkg_share, 'description', 'sam_bot_description.urdf')
     # 你的世界文件路径
-    world_file = os.path.join(pkg_share, 'world', 'my_world.sdf')
+    # 【改动】换成停车场场景 world/my_carpark（约 20×20 m，与 display.launch.py
+    # 使用同一个 world；文件名无 .sdf 后缀，按内容解析）。
+    # 其他场景保留在 world/ 下，可随时改回：my_newworld.sdf / my_world.sdf。
+    world_file = os.path.join(pkg_share, 'world', 'my_carpark')
     # 你刚刚保存的地图路径 (在新建的 map 文件夹下)
     map_file = os.path.join(pkg_share, 'map', 'my_map.yaml')
     # 你的 Nav2 参数文件
@@ -50,10 +54,13 @@ def generate_launch_description():
     )
 
     # (2) 启动 Gazebo 客户端 (图形界面)
+    #     【改动】gui:=false 可跳过 gzclient。本机 WSL2 下 GL 用 Mesa swrast
+    #     软件渲染，gzclient 渲染带贴图/车辆模型的场景非常吃 CPU；只想看 RViz 时可关掉。
     gzclient = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(pkg_gazebo_ros, 'launch', 'gzclient.launch.py')
-        )
+        ),
+        condition=IfCondition(LaunchConfiguration('gui', default='true'))
     )
 
     # (3) 启动机器人状态发布者 (解析 URDF，发布 TF)
@@ -87,8 +94,11 @@ def generate_launch_description():
         # 平均进重力估计，使重力向量偏 ~7°，导致里程计位置一路漂移到十几米外
         # （odom->base_link z 掉到 -3m）。改到 z=0.24 让机器人一出生就落地，
         # FAST-LIO 初始化的重力向量才干净、里程计不发散。
+        # 【改动】起点在世界原点 (2.0, 2.7)：停车场布局下这里离最近隔墙 3.35 m，
+        # 在行车通道上、不压车位线。display.launch.py 必须保持一致，
+        # 否则 2D/3D 地图的原点会错位。
         arguments=['-topic', 'robot_description', '-entity', 'sam_bot',
-                   '-timeout', '120', '-z', '0.24'],
+                   '-timeout', '120', '-x', '2.0', '-y', '2.7', '-z', '0.24'],
         output='screen'
     )
 
@@ -212,9 +222,9 @@ def generate_launch_description():
         name='rviz2',
         arguments=['-d', rviz_config_file],
         parameters=[{'use_sim_time': use_sim_time}],
-        # 与 display.launch.py 一致：强制 GL 2.1，避免 nav2 的 Map/Costmap 着色器
-        # (sampler1D) 在 GL3+ core profile 下崩溃
-        additional_env={'MESA_GL_VERSION_OVERRIDE': '2.1'},
+        # 【改动】去掉原来的 MESA_GL_VERSION_OVERRIDE=2.1：Mesa 默认给的是 GL 4.1
+        # 兼容模式（不是 core profile），实测 rviz2 跑 GL 4.1 正常；而 Map 显示器的
+        # "indexed_8bit_image" GLSL link 错误在 2.1 和 4.1 下都会出现，跟这个变量无关。
         output='screen'
     )
 
@@ -224,6 +234,11 @@ def generate_launch_description():
             'use_sim_time',
             default_value='true',
             description='Use simulation clock if true'
+        ),
+        DeclareLaunchArgument(
+            'gui',
+            default_value='true',
+            description='Open Gazebo GUI (gzclient); false = headless'
         ),
         gzserver,
         gzclient,

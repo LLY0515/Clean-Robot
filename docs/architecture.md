@@ -334,11 +334,30 @@ free_thresh: 0.25
 | 代价地图 | 全局/局部 | 坐标系 | 更新频率 | 图层 |
 |----------|-----------|--------|----------|------|
 | `global_costmap` | 全局 | `map` | 1 Hz | static_layer + obstacle_layer + inflation_layer |
-| `local_costmap` | 局部（滚动） | `odom` | 10 Hz | voxel_layer + inflation_layer |
+| `local_costmap` | 局部（滚动） | `odom` | 5 Hz | obstacle_layer + inflation_layer |
 
-- 两者都用 `/scan`（激光）标记障碍物；
+- 两者都用**两个观测源**：`/scan`（`LaserScan`）+ `/cloud_registered`
+  （FAST-LIO 配准后的 `PointCloud2`，odom 系、约 10 Hz），`marking`/`clearing`
+  都打开：
+  - `/scan` 由 `/livox/lidar` 投影而来，已经把地面按高度滤掉，标记可靠；
+  - `/cloud_registered` 每帧上千点、覆盖整个前方，作为**稠密清除射线**。
+    只用 `/scan` 时，30° 前倾使 360 束里只剩 120 多束有效回波，障碍物拖走后
+    没有任何射线穿过的栅格永远清不掉 —— 这正是"障碍物移开了、代价地图上的
+    障碍包络却一直留着"的原因。加上点云源后实测 4~6 s 内包络连同膨胀全部消失。
+  - 点云源用 `min_obstacle_height: -0.85` 把地面（odom 系 z ≈ -1.14）滤掉，
+    否则整片地面会被标成障碍；
+  - 清除射程局部图取 6 m（窗口只有 4×4 m）、全局图也取 6 m：全局图 21×21 m，
+    若整幅扫描，单次更新会超过 `update_frequency` 周期，缓冲区越积越多。
 - 全局代价地图叠加了 `/map` 静态地图，用于全局规划；
-- 局部代价地图只保留机器人周围 3×3 m 的滚动窗口，用于局部避障。
+- 局部代价地图只保留机器人周围 4×4 m 的滚动窗口，用于局部避障；
+- 局部图原来用的是 `VoxelLayer`，但它把 z 索引塞进 uint32 的低/高 16 位、
+  `z_voxels` 上限 16，`origin_z`/`z_voxels` 一配错就会**静默**丢掉所有点
+  （表现为局部图恒为 0/6400、怎么拖障碍物都没反应）。`/scan` 本来就是
+  一平面 2D 扫描，没有立体信息，因此改成和全局图一样的 `ObstacleLayer`，
+  只用 `min/max_obstacle_height` 做高度过滤，不再有隐式 z 窗口。
+- 两个图层的 `min_obstacle_height` 都是 `-2.0`：FAST-LIO 的 odom 原点在
+  IMU 起始位姿上（离地约 1.15 m），`base_link` 在 odom 系 z ≈ -0.96，
+  `/scan` 的点也在这一高度，用默认的 0.0 会把所有点当"地面以下"丢掉。
 
 ### 7.3 速度控制链（已实测核实）
 
@@ -451,8 +470,8 @@ prior_3d_map.pcd ───┘            ├──► /localization_pose（定�
 ```
 src/sam_bot_description/map/my_map.yaml ──► map_server ──► /map ──► global_costmap
                                             │
-/scan ──► global_costmap（障碍层）          │
-/scan ──► local_costmap（voxel 层）         │
+/scan ──────────┐                           │
+/cloud_registered ──┴──► 两张图的障碍层（标记 + 稠密清除）
                                             ▼
 RViz 目标 ──► bt_navigator ──► planner_server ──► 全局路径 ──► controller_server
                                                                   │
@@ -473,7 +492,7 @@ local_costmap ──────────────────────
 | `/demo/odom` | Odometry | diff_drive | （仅调试用，导航不消费） |
 | `/livox/imu` | Imu | imu_sensor 插件 | fastlio_mapping |
 | `/livox/lidar` | PointCloud2 | mid360 插件 | fastlio_mapping、pointcloud_to_laserscan |
-| `/cloud_registered` | PointCloud2 | fastlio_mapping（odom 系、去畸变） | fastlio_relocalization |
+| `/cloud_registered` | PointCloud2 | fastlio_mapping（odom 系、去畸变） | fastlio_relocalization、两张代价地图的障碍层（稠密清除） |
 | `/Odometry` | Odometry | fastlio_mapping | 重定位节点（取时间戳/调试） |
 | `/scan` | LaserScan | pointcloud_to_laserscan（由 `/livox/lidar` 投影） | global_costmap、local_costmap |
 | `/joint_states` | JointState | joint_state_publisher 插件 | robot_state_publisher |

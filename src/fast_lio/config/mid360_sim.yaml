@@ -21,7 +21,17 @@
             scan_line:  4
             blind: 0.5
             timestamp_unit: 3
-            scan_rate: 10
+            # 仿真雷达每帧是"瞬时快照"（2500 条射线在同一仿真时刻投射），没有扫描过程。
+            # 但 lidar_type=4 的 mid360_handler 用方位角反推每点时间：
+            #   curvature(ms) = Δ方位角 / (0.361 * scan_rate)
+            # scan_rate=10 时整帧被判成横跨 360/(0.361*10)=99.7ms，于是 lidar_end_time
+            # 比真实拍摄时刻晚 0.1s：FAST-LIO 把 T 时刻的姿态打上 T+0.1 的戳，
+            # 而 slam_toolbox 按 /scan 的戳 T 查 TF，拿到的是机体在 T+0.1 的位姿 ——
+            # 每帧扫描都被用"晚了 0.1s"的位姿放进地图，转向时地图就被抹歪。
+            # 实测 0.89rad/s 转向时偏航误差 7.3°，把时间戳整体前移 0.15s 后降到 0.67°。
+            # 故这里把 scan_rate 调大，使跨度≈1ms（360/361≈0.997ms）。
+            # 真机（真实 100ms 扫描）请改回 10。
+            scan_rate: 1000
 
         mapping:
             acc_cov: 0.1
@@ -35,8 +45,8 @@
             fov_degree:    360.0
             det_range:     100.0
             extrinsic_est_en:  false      # true: enable the online estimation of IMU-LiDAR extrinsic
-            # 雷达 link 物理前倾 30°（绕 base_link +y），IMU 坐标系反向旋回水平。
-            # 因此 lidar->IMU 的旋转为 Ry(+30°)，平移为 -Ry(30°)·t_imu
+            # 【当前：雷达 link 物理前倾 30°（绕 base_link +y），IMU 坐标系反向
+            # 旋回水平】因此 lidar->IMU 的旋转为 Ry(+30°)，平移为 -Ry(30°)·t_imu
             # （t_imu=(0.011,0.02329,-0.04412) 为 IMU 在雷达系下的安装位置）。
             extrinsic_T: [ 0.0125337, -0.02329, 0.0437090 ]
             extrinsic_R: [ 0.8660254, 0., 0.5,

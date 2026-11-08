@@ -37,7 +37,12 @@ Visualization Manager:
       Show Arrows: true
       Show Axes: true
       Show Names: true
-    - Class: rviz_default_plugins/Map
+    # 【改动】显式指定配色：free=白、unknown=灰、occupied=黑。
+    # RViz2 的 Map 显示默认是 costmap 配色（free 呈深灰绿），叠加在深色背景上
+    # 很难和障碍物区分；"map" 配色下空白区域是亮色、墙体是纯黑，和 Gazebo 对照更直观。
+    - Alpha: 0.7
+      Class: rviz_default_plugins/Map
+      Color Scheme: map
       Enabled: true
       Name: Map
       Topic:
@@ -54,6 +59,22 @@ Visualization Manager:
         Value: /map_updates
       Use Timestamp: false
       Value: true
+    # 【改动】把实时 /scan 也画出来：地图（黑色墙体）和当前激光点是否重合，
+    # 是判断 "Gazebo ↔ RViz 是否错位" 最直接的方法。以前只显示地图，
+    # 地图略有漂移时看不出是地图问题还是定位问题。
+    - Alpha: 1
+      Class: rviz_default_plugins/LaserScan
+      Color: 0; 255; 0
+      Enabled: true
+      Name: LaserScan
+      Style: Points
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /scan
+      Use Fixed Frame: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
