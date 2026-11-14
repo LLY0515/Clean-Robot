@@ -102,6 +102,25 @@ class SwathSupervisor:
             s += step
         return True
 
+    def _swept_clear(self, a, u, n, s_from, s_to, half_width, step=0.1):
+        """车心在 [s_from, s_to] 之间时，横向 ±half_width 的矩形是否干净。
+
+        比条带走廊（half_width=0.25）宽：车体半宽约 0.33 m，而且绕行目标是
+        "整台车停在这个点上"，车尾会向后伸出 0.545 m（后角点 0.66 m）。
+        只用车心圆检查回轨点会让车尾压在障碍物上（run50 回轨点距离箱子
+        尾缘只有 0.4 m，控制器逐帧拒绝 goal）。
+        """
+        offsets = np.arange(-half_width, half_width + 1e-9, 0.05)
+        s = max(0.0, s_from)
+        while s <= s_to + 1e-9:
+            px = a[0] + u[0] * s
+            py = a[1] + u[1] * s
+            for off in offsets:
+                if self._blocked_at(px + n[0] * off, py + n[1] * off):
+                    return False
+            s += step
+        return True
+
     def _disk_clear(self, x, y, radius, threshold):
         """以 (x, y) 为圆心、radius 为半径的圆内是否有 >= threshold 的栅格。
 
@@ -165,7 +184,8 @@ class SwathSupervisor:
     # 回轨点
     # ------------------------------------------------------------------ #
     def find_rejoin(self, a, b, s_now, lookahead=3.0, clear_run=1.4,
-                    rejoin_margin=1.0, step=0.1):
+                    rejoin_margin=1.0, step=0.1, back_clear=0.9,
+                    back_half_width=0.35):
         """找到"障碍物之后、仍在这条 swath 直线上"的回轨点。
 
         返回 (rejoin_s, None) 或 (None, 原因字符串)。
@@ -203,17 +223,21 @@ class SwathSupervisor:
                     s += step
                     continue
                 px, py = point_at(a, b, rejoin_s)
-                if self._footprint_free(px, py):
+                if (self._footprint_free(px, py) and
+                        self._swept_clear(a, u, n, rejoin_s - back_clear,
+                                          rejoin_s, back_half_width)):
                     return rejoin_s, None
             s += step
 
         return None, 'no clear run before swath end'
 
-    def find_free_ahead(self, a, b, s_now, search=2.5, clear_run=1.0, step=0.25):
+    def find_free_ahead(self, a, b, s_now, search=2.5, clear_run=1.0, step=0.25,
+                        back_clear=0.9, back_half_width=0.35):
         """进度停滞兜底：在前方 search 米内找一个可通行的点作为绕行目标。
 
-        只要求该点 footprint 可放且该点之后 clear_run 米走廊干净，
-        不要求检测到明确的障碍物区间。
+        要求该点 footprint 可放、该点之后 clear_run 米走廊干净，且该点
+        **身后** back_clear 米（车尾长度+余量）同样干净——绕行目标必须让
+        整台车停得下，而不只是车心。
         """
         if not self.is_fresh():
             return None
@@ -226,7 +250,9 @@ class SwathSupervisor:
             px, py = point_at(a, b, s)
             window_end = min(length, s + clear_run)
             if (self._footprint_free(px, py) and
-                    self._corridor_clear(a, u, n, s, window_end)):
+                    self._corridor_clear(a, u, n, s, window_end) and
+                    self._swept_clear(a, u, n, s - back_clear, s,
+                                      back_half_width)):
                 return s
             s += step
         return None

@@ -1,0 +1,181 @@
+controller_server:
+  ros__parameters:
+    controller_plugins: [FollowPath, CoverageApproach, CoverageForward, CoverageContinuous]
+    goal_checker_plugins: [general_goal_checker, coverage_goal_checker, coverage_start_goal_checker, continuous_goal_checker, exact_start_checker]
+    exact_start_checker:
+      plugin: nav2_controller::StoppedGoalChecker
+      xy_goal_tolerance: 0.08
+      yaw_goal_tolerance: 0.08726646259971647  # 5 degrees; within the continuous tracking envelope.
+      stateful: false
+      trans_stopped_velocity: 0.04
+      rot_stopped_velocity: 0.03
+    continuous_goal_checker:
+      plugin: nav2_controller::SimpleGoalChecker
+      xy_goal_tolerance: 0.04
+      yaw_goal_tolerance: 0.06
+      stateful: false
+    CoverageContinuous:
+      plugin: ego_nav2_controller::EgoController
+      preserve_reference_curve: true
+      max_linear_vel: 0.80
+      max_linear_accel: 0.20
+      max_angular_vel: 0.30
+      max_angular_accel: 0.4
+      lookahead_dist: 0.12
+      planning_horizon: 3.5
+      curve_preview_dist: 3.0
+      maneuver_max_linear_vel: 0.25
+      obstacle_slow_distance: 1.2
+      speed_reaction_time: 0.6
+      speed_transition_margin: 0.15
+      obstacle_clearance: 0.60
+      max_pose_age: 0.5
+      planning_time_budget: 0.25
+    FollowPath:
+      plugin: ego_nav2_controller::EgoController
+      max_linear_vel: 0.30
+      max_angular_vel: 0.30
+      max_linear_accel: 0.2
+      max_angular_accel: 0.4
+      lookahead_dist: 0.7
+      planning_horizon: 4.5
+      replan_period: 0.5
+      planning_time_budget: 0.25
+      max_pose_age: 0.5
+      rotate_enter_angle: 0.50
+      rotate_exit_angle: 0.25
+      replan_frame_translation: 0.03
+      replan_frame_rotation: 0.017453292519943295
+      obstacle_clearance: 0.60
+      optimization_clearance_margin: 0.10
+      route_return_weight: 0.4
+      route_length_weight: 0.05
+      smooth_detour_enabled: true
+      detour_transition_length: 1.5
+      detour_max_offset: 1.8
+      detour_reference_weight: 1.5
+      return_min_forward_distance: 1.2
+      curve_preview_dist: 3.0
+      max_lateral_accel: 0.12
+      maneuver_max_linear_vel: 0.25
+      maneuver_curvature_threshold: 0.15
+      obstacle_slow_distance: 1.2
+      speed_reaction_time: 0.6
+      speed_transition_margin: 0.15
+      return_check_period: 0.5
+      return_min_deviation: 0.20
+      return_min_improvement: 0.05
+      return_max_path_age: 3.0
+      return_confirmations: 2
+    CoverageApproach:
+      precise_goal_alignment: true
+      plugin: ego_nav2_controller::EgoController
+      max_linear_vel: 0.80
+      max_angular_vel: 0.30
+      max_linear_accel: 0.2
+      max_angular_accel: 0.4
+      lookahead_dist: 0.7
+      planning_horizon: 4.5
+      replan_period: 0.5
+      planning_time_budget: 0.25
+      max_pose_age: 0.5
+      rotate_enter_angle: 0.50
+      rotate_exit_angle: 0.25
+      replan_frame_translation: 0.03
+      replan_frame_rotation: 0.017453292519943295
+      obstacle_clearance: 0.60
+      optimization_clearance_margin: 0.10
+      route_return_weight: 0.4
+      route_length_weight: 0.05
+      smooth_detour_enabled: true
+      detour_transition_length: 1.5
+      detour_max_offset: 1.8
+      detour_reference_weight: 1.5
+      return_min_forward_distance: 1.2
+      curve_preview_dist: 3.0
+      max_lateral_accel: 0.12
+      maneuver_max_linear_vel: 0.25
+      maneuver_curvature_threshold: 0.15
+      obstacle_slow_distance: 1.2
+      speed_reaction_time: 0.6
+      speed_transition_margin: 0.15
+      return_check_period: 0.5
+      return_min_deviation: 0.20
+      return_min_improvement: 0.05
+      return_max_path_age: 3.0
+      return_confirmations: 2
+    CoverageForward:
+      plugin: ego_nav2_controller::EgoController
+      max_linear_vel: 0.60
+      max_angular_vel: 0.30
+      max_linear_accel: 0.2
+      max_angular_accel: 0.4
+      lookahead_dist: 0.7
+      planning_horizon: 4.5
+      replan_period: 0.5
+      planning_time_budget: 0.25
+      max_pose_age: 0.5
+      rotate_enter_angle: 0.50
+      rotate_exit_angle: 0.25
+      replan_frame_translation: 0.03
+      replan_frame_rotation: 0.017453292519943295
+      obstacle_clearance: 0.60
+      optimization_clearance_margin: 0.10
+      route_return_weight: 0.4
+      route_length_weight: 0.05
+      smooth_detour_enabled: true
+      detour_transition_length: 1.5
+      detour_max_offset: 1.8
+      detour_reference_weight: 1.5
+      return_min_forward_distance: 1.2
+      curve_preview_dist: 3.0
+      max_lateral_accel: 0.12
+      maneuver_max_linear_vel: 0.25
+      maneuver_curvature_threshold: 0.15
+      obstacle_slow_distance: 1.2
+      speed_reaction_time: 0.6
+      speed_transition_margin: 0.15
+      return_check_period: 0.5
+      return_min_deviation: 0.20
+      return_min_improvement: 0.05
+      return_max_path_age: 3.0
+      return_confirmations: 2
+velocity_smoother:
+  ros__parameters:
+    # Covers approach/continuous 0.80 m/s and both signs of recovery commands.
+    # Acceleration matches EGO; braking is stronger than its planned 0.2/0.4
+    # envelope so slowing down for turns/obstacles is not rate-limited further.
+    max_velocity: [0.80, 0.0, 0.30]
+    min_velocity: [-0.30, 0.0, -0.30]
+    max_accel: [0.20, 0.0, 0.40]
+    max_decel: [-0.40, 0.0, -0.80]
+
+behavior_server:
+  ros__parameters:
+    max_rotational_vel: 0.30
+    rotational_acc_lim: 0.40
+    spin:
+      plugin: ego_nav2_controller::ClearanceSpin
+      heading_frame: map
+      reaction_time: 0.20
+      yaw_tolerance: 0.03490658503988659
+      stopped_angular_vel: 0.03
+      settle_time: 0.20
+      max_odom_age: 0.50
+      max_correction_yaw: 0.10
+      max_correction_translation: 0.20
+    backup:
+      plugin: ego_nav2_controller::ClearanceBackUp
+    drive_on_heading:
+      plugin: ego_nav2_controller::ClearanceDrive
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      width: 12
+      height: 12
+      plugins: ["stvl_lidar", "stvl_camera", "inflation_layer"]
+
+planner_server:
+  ros__parameters:
+    GridBased:
+      plugin: ego_nav2_controller::ExactGoalLattice

@@ -29,9 +29,12 @@ import rclpy
 import yaml
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseStamped
+from lifecycle_msgs.msg import State, Transition
+from lifecycle_msgs.srv import ChangeState, GetState
 from nav2_msgs.action import ComputePathToPose, FollowPath, NavigateToPose
-from nav_msgs.msg import Path
+from nav_msgs.msg import OccupancyGrid, Path
 from rclpy.action import ActionClient
+from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
@@ -63,6 +66,10 @@ from opennav_coverage_msgs.action import ComputeCoveragePath
 WAIT_READY = 'WAIT_READY'
 START_NAV_SEND = 'START_NAV_SEND'
 START_NAV_WAIT = 'START_NAV_WAIT'
+START_NAV_RETRY_WAIT = 'START_NAV_RETRY_WAIT'
+# 起点头导航失败后的退避时间（秒）：Nav2 lifecycle 激活需要几秒，
+# 期间 NavigateToPose 会被 action server 立刻拒绝。
+START_NAV_RETRY_DELAY = 3.0
 PLAN_SEND = 'PLAN_SEND'
 PLAN_WAIT = 'PLAN_WAIT'
 TRANSIT_SEND = 'TRANSIT_SEND'
@@ -103,6 +110,31 @@ class CoverageExecutor(Node):
         # 条带，省掉停顿和原地转向；转场规划失败时自动回退到 NavigateToPose。
         self.declare_parameter('smooth_transit', True)
         self.declare_parameter('plan_timeout', 10.0)
+        # 并入角保护：接近路径末段方向与条带方向的夹角超过该值（弧度）时，
+        # 不再"转场 + 条带"拼成一条 FollowPath。
+        # 【实测背景】run4 第 1 段从 (-2.17,-5.00) 规划到条带东端
+        # (1.53,-8.45)，接近路径末段朝东南、条带朝西，夹角 133°，拼接处是
+        # 一个尖角。DWB 按最近点裁剪全局路径：车头一拐弯离开条带线，最近点
+        # 就跳回"去起点"那条腿，控制器又把它开回尖角，结果在原地 2 m 范围
+        # 来回画圈 190 s，最后靠 FollowPath 超时脱身，还漏扫了前 3.19 m。
+        # 夹角过大时改用 NavigateToPose 到条带起点（到位后 BT 会原地转向），
+        # 条带本身仍是一条直线，不存在两条腿互相抢最近点的问题。
+        self.declare_parameter('merge_max_join_angle', 1.0)
+        # 条带起点可站立性：条带端头离墙太近时，车体在起点原地转身会扫到
+        # 障碍（车体半对角线 0.77 m）。这里要求起点周围 entry_clearance 米
+        # 内没有致命栅格；不满足就把起点沿条带方向内移，最多 entry_max_shift。
+        # 【实测背景】本图第 1 段起点 (1.53,-8.45) 的最近致命格只有 0.72 m，
+        # 车在角上既转不开也退不出：NavigateToPose 反复 patience 超时，
+        # FollowPath 的 419 条轨迹全部被 ObstacleFootprint 判碰撞。
+        self.declare_parameter('entry_clearance', 0.95)
+        self.declare_parameter('entry_max_shift', 2.0)
+        # 整段跳过确认：单帧代价地图可能因为定位抖动、点云补全滞后或
+        # 重定位瞬间的位姿误差而临时"看不见"站得下的位置，直接丢掉
+        # 整条 swath 代价太大（run47 第 33 条就在 FAST-LIO 不稳定的
+        # 窗口里被判成"起点 2.0 m 内都贴着障碍"而跳过）。首次判定
+        # 跳过只记下时间，等 entry_confirm_delay 秒后复查仍然被挡才
+        # 真正跳过。
+        self.declare_parameter('entry_confirm_delay', 1.5)
 
         # 弧形换轨（优先于规划器）：换轨时直接生成"当前车头 -> 下一条带
         # 起点"的三次贝塞尔曲线，短距离相邻条带之间就是半圆/半椭圆。
@@ -149,6 +181,18 @@ class CoverageExecutor(Node):
         self.declare_parameter('clear_run', 1.4)
         self.declare_parameter('rejoin_margin', 1.0)
         self.declare_parameter('max_detours_per_swath', 3)
+        # 【改由控制器处理条带上的单个障碍】ego_nav2_controller 自带平滑绕行
+        # （smooth_detour_enabled）：它贴着原航线走到障碍物前方约 0.7 m 才横移，
+        # 一直保持横向偏移直到**车尾**越过障碍，再平滑回轨。执行器原来会取消
+        # FollowPath、让规划器重新规划一条到回轨点的路径，而规划器按最短路径
+        # 贴着膨胀层走，车尾还没越过障碍就开始斜切回条带——实测车尾角点离
+        # 障碍只剩 0.14 m（用户反馈"车屁股摆尾容易撞到障碍物"）。
+        # 打开后单个障碍交给控制器绕行；密集障碍区整段跳过、找不到回轨点
+        # 直接跳过剩余段等逻辑不受影响，控制器绕不过去时仍有停滞恢复兜底。
+        self.declare_parameter('controller_handles_swath_obstacles', True)
+        # FollowPath 在这么短时间内就 abort，说明控制器根本没起步（位姿被
+        # 判碰撞、所有采样轨迹一起作废），换回轨点没有意义，也不算一次绕行。
+        self.declare_parameter('detour_min_elapsed', 1.0)
 
         # 进度监控
         self.declare_parameter('stall_distance', 0.1)
@@ -175,10 +219,18 @@ class CoverageExecutor(Node):
         # 规划忽略孔洞是为了让条带网格整场统一；但执行时不能真的把车开进
         # 柱子/结构物。这里把每条 swath 在孔洞边界外 hole_clearance 处断开，
         # 剩下的连续段逐段执行（段内 FollowPath，段间 NavigateToPose 绕过去）。
-        # 区域多边形已经让孔洞比真实障碍物外扩约 0.55 m，再加 0.15 m 余量，
-        # 车头（前伸 0.545 m）停在断点处也不会贴到障碍物。
+        #
+        # hole_clearance 只解决"横向别贴着柱子"，不解决"车头别顶到柱子"：
+        # 断点之后机器人停在段末时，车体中心还在断点上，而车头已经前伸
+        # 0.55 m（footprint 前角 0.665 m），必然扫进孔洞。实测第 16 段就是这样
+        # 断在柱子前 0.15 m，DWB 的 ObstacleFootprint 判定当前位姿已碰撞，
+        # 419 条轨迹全废、控制器 patience 超时。
+        # 所以孔洞两侧的断点在沿 swath 方向要再退 hole_end_clearance：
+        # 车头 0.55 m + 0.05 m 余量。它只作用在被孔洞截出的端点，swath 的
+        # 真实两端仍只受 swath_end_trim 约束。
         self.declare_parameter('clip_swaths_at_holes', True)
         self.declare_parameter('hole_clearance', 0.15)
+        self.declare_parameter('hole_end_clearance', 0.60)
 
         # 定位跳变保护：map->base_link 单次跳变超过该值，或跑出所有分区
         # 包围盒外 pose_sanity_margin 米，就终止任务并停车。
@@ -187,6 +239,16 @@ class CoverageExecutor(Node):
         # 位姿发指令，车会盲开。宁可停机重定位，也不能盲开。
         self.declare_parameter('pose_jump_limit', 5.0)
         self.declare_parameter('pose_sanity_margin', 5.0)
+        # 里程计停更保护：map->base_link 的时间戳超过该秒数不再更新，说明
+        # FAST-LIO / 重定位没有输出新位姿。
+        # 【实测背景】run47 末尾 FAST-LIO 停更，控制器每 0.6 s 报一次
+        # "Stale pose or invalid measured velocity"（patience 35 次），但执行器
+        # 的跳变/越界保护看不到异常——位姿原地冻结，既不跳变也不越界。结果
+        # 卡在"转场->Goal failed->重试"循环里无法自愈（每轮还要等 BT 恢复
+        # 行为跑完 ~50 s）。这里显式检查位姿新鲜度：先调一次 /relocalize 争取
+        # 自动恢复，宽限期内仍无新位姿就终止任务并停车，交给人工重新定位。
+        self.declare_parameter('pose_stale_timeout', 5.0)
+        self.declare_parameter('pose_stale_grace', 20.0)
 
         # 覆盖规划参数（透传给 opennav_coverage）
         self.declare_parameter('generate_decomp', True)
@@ -220,6 +282,26 @@ class CoverageExecutor(Node):
             self, ComputePathToPose, 'compute_path_to_pose')
         self._cov_client = ActionClient(
             self, ComputeCoveragePath, 'compute_coverage_path')
+        # 关键节点生命周期自愈：见 _ensure_node_active()
+        self._lifecycle = {}
+        for name in ('coverage_server', 'map_server'):
+            self._lifecycle[name] = {
+                'state_client': self.create_client(
+                    GetState, name + '/get_state'),
+                'change_client': self.create_client(
+                    ChangeState, name + '/change_state'),
+                'active': False,
+                'pending': None,      # (kind, future)：在途的 get_state/change_state
+                'retry_after': None,  # 转换失败后的重试时刻
+            }
+
+        # 静态地图必须真的收到才能开始任务（map_server 没激活时 static_layer
+        # 是空的，全局规划器会一直报 "Robot is out of bounds"）。
+        self._map_msg = None
+        self.create_subscription(
+            OccupancyGrid, 'map', self._on_map,
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                       durability=DurabilityPolicy.TRANSIENT_LOCAL))
 
         # ---------------- 障碍检查 ----------------
         self._supervisor = SwathSupervisor(
@@ -263,9 +345,20 @@ class CoverageExecutor(Node):
         self._comp_idx = 0
         self._swath_start_s = 0.0
         self._detour_count = 0
+        self._quick_aborts = 0
         self._transit_retries = 0
         self._detour_nav_retries = 0
+        # 已经做过"起点内移"检查的条带下标（每段只做一次）
+        self._entry_checked = set()
+        # 第 idx 条 swath 首次被判"起点贴障碍"的时刻：跳过是永久决定，
+        # 必须等 entry_confirm_delay 秒复查仍然被挡才执行（见 _entry_adjust）。
+        self._entry_blocked_since = {}
         self._start_nav_retries = 0
+        # 【修复启动竞态】Nav2 的 action server 随节点创建就出现，但
+        # lifecycle 还没 activate 时 NavigateToPose 会被立刻拒绝（<0.1 s
+        # 返回失败）。原来重试之间没有间隔，0.5 s 内全部打完，任务直接
+        # "无法到达清扫起点"终止（run25）。失败后先退避再重试。
+        self._start_nav_retry_at = None
         self._timeout_retry_state = TRANSIT_SEND
         self._skipped = []
         self._rejoin_s = 0.0
@@ -297,9 +390,14 @@ class CoverageExecutor(Node):
         self._last_sane_pose = None
         self._last_sane_time = self.get_clock().now()
         self._sanity_bbox = None       # (xmin, xmax, ymin, ymax)
+        # 最近一次成功 TF 查询的时间戳（sim time）与"开始停更"的时刻。
+        self._last_tf_stamp = None
+        self._stale_since = None
+        self._relocalize_client = self.create_client(Trigger, 'relocalize')
 
         self._start_requested = bool(self.get_parameter('auto_start').value)
         self._cancel_requested = False
+        self._wait_ready_warned = None
 
         self._load_area()
 
@@ -456,6 +554,91 @@ class CoverageExecutor(Node):
                 self._follow_client.server_is_ready() and
                 self._cov_client.server_is_ready())
 
+    def _ensure_node_active(self, name):
+        """返回节点是否已 active；未 active 时按需驱动生命周期（自愈）。
+
+        【实测背景】run49 启动时 lifecycle_manager_localization 报
+        "failed to send response to /map_server/change_state (timeout)"，
+        配置回调只跑了 0.1 s 就发响应仍超时（DDS 响应在负载下丢 ACK），
+        管理器放弃后续 activate：map_server 停在 inactive，global_costmap
+        的 static_layer 一直是空的（"Can't update static costmap layer,
+        no map received"），规划器一直报 "Robot is out of bounds"，车
+        纹丝不动。run44 / run48 是同一个故障打在 coverage_server 上
+        （configure 初始化 Fields2Cover 时响应超时，随后
+        "覆盖规划 action 失败：status=0"）。
+
+        这里不依赖生命周期管理器的时序：执行器自己查状态，需要时代为
+        configure / activate（每次 tick 推进一小步，不阻塞状态机）。
+        """
+        info = self._lifecycle[name]
+        if info['active']:
+            return True
+        st_client = info['state_client']
+        ch_client = info['change_client']
+        if not (st_client.service_is_ready() and
+                ch_client.service_is_ready()):
+            return False
+        now = self.get_clock().now()
+
+        if info['pending'] is not None:
+            kind, fut = info['pending']
+            if not fut.done():
+                return False
+            info['pending'] = None
+            resp = fut.result()
+            if kind == 'state':
+                if resp is None:
+                    info['retry_after'] = now + Duration(seconds=2.0)
+                    return False
+                state = resp.current_state.id
+                if state == State.PRIMARY_STATE_ACTIVE:
+                    info['active'] = True
+                    self.get_logger().info('%s 状态正常（active）' % name)
+                    return True
+                if state == State.PRIMARY_STATE_UNCONFIGURED:
+                    transfer = Transition.TRANSITION_CONFIGURE
+                    kind = 'configure'
+                elif state == State.PRIMARY_STATE_INACTIVE:
+                    transfer = Transition.TRANSITION_ACTIVATE
+                    kind = 'activate'
+                else:
+                    info['retry_after'] = now + Duration(seconds=2.0)
+                    self.get_logger().warn(
+                        '%s 处于 state=%d，无法代为驱动生命周期'
+                        % (name, state))
+                    return False
+                req = ChangeState.Request()
+                req.transition.id = transfer
+                info['pending'] = (kind, ch_client.call_async(req))
+                self.get_logger().warn(
+                    '%s 停在 %s（生命周期管理器可能已失败），执行器代为 %s' %
+                    (name,
+                     'unconfigured' if kind == 'configure' else 'inactive',
+                     kind))
+                return False
+            # change_state 结果
+            if kind == 'activate' and resp is not None and resp.success:
+                info['active'] = True
+                self.get_logger().info('%s 已由执行器激活' % name)
+                return True
+            if resp is None or not resp.success:
+                info['retry_after'] = now + Duration(seconds=2.0)
+                self.get_logger().warn(
+                    '%s %s 转换失败，2 s 后重试' % (name, kind))
+                return False
+            # configure 成功：下个 tick 重新查状态，继续 activate
+        if info['retry_after'] is not None and now < info['retry_after']:
+            return False
+        info['pending'] = ('state', st_client.call_async(GetState.Request()))
+        return False
+
+    def _on_map(self, msg):
+        if self._map_msg is None:
+            self.get_logger().info(
+                '已收到静态地图 %d x %d（分辨率 %.2f m）' %
+                (msg.info.width, msg.info.height, msg.info.resolution))
+        self._map_msg = msg
+
     # ================================================================== #
     # 主循环
     # ================================================================== #
@@ -474,6 +657,8 @@ class CoverageExecutor(Node):
             self._tick_start_nav_send()
         elif self._state == START_NAV_WAIT:
             self._tick_start_nav_wait()
+        elif self._state == START_NAV_RETRY_WAIT:
+            self._tick_start_nav_retry_wait()
         elif self._state == PLAN_SEND:
             self._tick_plan_send()
         elif self._state == PLAN_WAIT:
@@ -519,9 +704,11 @@ class CoverageExecutor(Node):
         if self._state in (WAIT_READY, DONE, ABORT):
             return True
         pose = self._robot_pose()
+        now = self.get_clock().now()
+        if self._check_pose_stale(now):
+            return False
         if pose is None:
             return True
-        now = self.get_clock().now()
         if self._last_sane_pose is not None:
             dt = (now - self._last_sane_time).nanoseconds * 1e-9
             if 0.0 < dt <= 1.0:
@@ -551,6 +738,51 @@ class CoverageExecutor(Node):
         self._last_sane_time = now
         return True
 
+    def _check_pose_stale(self, now):
+        """位姿停更保护（pose_stale_timeout / pose_stale_grace）。
+
+        返回 True 表示当前位姿已经停更、本 tick 不应继续下发任何动作。
+        首次发现停更时请求一次 /relocalize 争取自动恢复；宽限期内仍没有
+        新位姿就终止任务并停车（Nav2 取消 goal 即停车）。
+
+        【实测背景】run47 末尾 FAST-LIO 停更，map->base_link 的时间戳不再
+        前进。位姿原地冻结，跳变/越界检查都发现不了，执行器于是陷在
+        "转场 -> Goal failed -> 重试"里，控制器只能一遍遍报 patience。
+        """
+        if self._state in (WAIT_READY, DONE, ABORT, CANCEL_WAIT):
+            return False
+        if self._last_tf_stamp is None:
+            return False
+        age = (now - Time.from_msg(self._last_tf_stamp)).nanoseconds * 1e-9
+        limit = float(self.get_parameter('pose_stale_timeout').value)
+        if limit <= 0 or age <= limit:
+            if self._stale_since is not None:
+                self.get_logger().info('位姿恢复更新（停更 %.1f s 后），继续任务'
+                                       % age)
+            self._stale_since = None
+            return False
+        if self._stale_since is None:
+            self._stale_since = now
+            self.get_logger().warn(
+                '位姿已 %.1f s 未更新（FAST-LIO/重定位停更），暂停任务并请求 '
+                '/relocalize' % age)
+            self._request_relocalize()
+            return True
+        waited = (now - self._stale_since).nanoseconds * 1e-9
+        grace = float(self.get_parameter('pose_stale_grace').value)
+        if waited > grace:
+            self._abort('定位里程计停更 %.1f s（FAST-LIO/重定位无新位姿），已停车'
+                        % age)
+        return True
+
+    def _request_relocalize(self):
+        client = self._relocalize_client
+        if not client.service_is_ready():
+            self.get_logger().warn(
+                '3D 重定位服务 /relocalize 不可用，等待宽限期结束')
+            return
+        client.call_async(Trigger.Request())
+
     # ------------------------------------------------------------------ #
     def _tick_wait_ready(self):
         if not self._start_requested:
@@ -558,6 +790,24 @@ class CoverageExecutor(Node):
         if not self._zones:
             return
         if not self._clients_ready():
+            return
+        # 关键节点可能因生命周期管理器超时停在 inactive（见
+        # _ensure_node_active 的说明），等它们真正 active、静态地图也收到
+        # 之后再开始任务，否则会带着空静态层导航、原地不动。
+        missing = []
+        if not self._ensure_node_active('map_server'):
+            missing.append('map_server 未激活')
+        if self._map_msg is None:
+            missing.append('静态地图未收到')
+        if not self._ensure_node_active('coverage_server'):
+            missing.append('coverage_server 未激活')
+        if missing:
+            now = self.get_clock().now()
+            if (self._wait_ready_warned is None or
+                    (now - self._wait_ready_warned).nanoseconds * 1e-9 > 5.0):
+                self._wait_ready_warned = now
+                self.get_logger().warn(
+                    '等待启动条件：%s' % '、'.join(missing))
             return
         self._start_requested = False
         self._reset_mission()
@@ -602,12 +852,15 @@ class CoverageExecutor(Node):
                 self._set_state(PLAN_SEND)
                 return
             self._start_nav_retries += 1
-            if self._start_nav_retries > 2:
+            if self._start_nav_retries > 5:
                 self._abort('无法到达清扫起点')
             else:
                 self.get_logger().warn(
-                    '前往清扫起点失败，重试 %d/2' % self._start_nav_retries)
-                self._set_state(START_NAV_SEND)
+                    '前往清扫起点失败，%.0f s 后重试 %d/5' %
+                    (START_NAV_RETRY_DELAY, self._start_nav_retries))
+                self._start_nav_retry_at = self.get_clock().now() + Duration(
+                    seconds=START_NAV_RETRY_DELAY)
+                self._set_state(START_NAV_RETRY_WAIT)
             return
         if self._goal_elapsed() > float(self.get_parameter('nav_timeout').value):
             self.get_logger().warn('前往清扫起点超时，取消后重试')
@@ -615,21 +868,33 @@ class CoverageExecutor(Node):
             self._cancel_active()
             self._set_state(TRANSIT_TIMEOUT_WAIT)
 
+    def _tick_start_nav_retry_wait(self):
+        if self._start_nav_retry_at is None or (
+                self.get_clock().now() < self._start_nav_retry_at):
+            return
+        self._start_nav_retry_at = None
+        self._set_state(START_NAV_SEND)
+
     def _reset_mission(self):
         self._zone_idx = 0
         self._comp_idx = 0
         self._swath_start_s = 0.0
         self._detour_count = 0
+        self._quick_aborts = 0
         self._detour_guard_s = None
         self._transit_retries = 0
         self._detour_nav_retries = 0
         self._start_nav_retries = 0
+        self._start_nav_retry_at = None
         self._timeout_retry_state = TRANSIT_SEND
         self._stall_fallbacks = 0
+        self._entry_checked = set()
+        self._entry_blocked_since = {}
         self._skipped = []
         self._cancel_requested = False
         self._last_sane_pose = None
         self._last_sane_time = self.get_clock().now()
+        self._stale_since = None
 
     def _tick_plan_send(self):
         if self._zone_idx >= len(self._zones):
@@ -692,7 +957,9 @@ class CoverageExecutor(Node):
         self._components = swaths
         self._comp_idx = 0
         self._swath_start_s = 0.0
+        self._entry_checked = set()
         self._detour_count = 0
+        self._quick_aborts = 0
         self._detour_guard_s = None
         self._transit_retries = 0
         self._publish_swath_path(swaths)
@@ -706,12 +973,93 @@ class CoverageExecutor(Node):
         self._set_state(TRANSIT_SEND)
 
     # ------------------------------------------------------------------ #
+    def _entry_adjust(self):
+        """条带起点贴障碍时，把起点沿条带方向内移（每段只做一次）。
+
+        车体半对角线 0.77 m：条带端头离墙/柱子太近时，车在起点既转不开
+        （原地转身会扫到障碍），也退不出去（min_vel_x=0 不许倒车）——
+        表现为 NavigateToPose 反复 patience 超时，或者 FollowPath 的
+        419 条采样轨迹全部被 ObstacleFootprint 判碰撞。
+
+        这里要求起点周围 entry_clearance 米内没有致命栅格；不满足就沿
+        条带方向每 0.1 m 内移，最多 entry_max_shift 米。被放弃的端点段
+        很短（本图 0.5 m 左右），换来的是这条 swath 能真正走通。
+        内移上限内仍站不住则整段跳过（对应"障碍密集处可以不清扫"），
+        但要先等 entry_confirm_delay 秒复查确认（见该参数的注释）。
+
+        返回 False 表示本 tick 不下发任何动作：要么整段已跳过，要么
+        正在等待跳过确认；调用方应直接返回，状态机下个 tick 会重新进来。
+        """
+        idx = self._comp_idx
+        if idx in self._entry_checked:
+            return True
+        a, b = self._components[idx]
+        length = segment_length(a, b)
+        radius = float(self.get_parameter('entry_clearance').value)
+        max_shift = min(float(self.get_parameter('entry_max_shift').value),
+                        max(length - 0.3, 0.0))
+        s = 0.0
+        chosen = None
+        while s <= max_shift + 1e-6:
+            p = point_at(a, b, s)
+            clear = self._supervisor.path_clear(
+                [(p[0], p[1])], threshold=100, radius=radius)
+            if clear is None:
+                # 代价地图还没就绪/过期：下个 tick 再判断，别急着内移
+                return True
+            if clear:
+                chosen = s
+                break
+            s = round(s + 0.1, 3)
+        if chosen is None:
+            now = self.get_clock().now()
+            since = self._entry_blocked_since.get(idx)
+            if since is None:
+                self._entry_blocked_since[idx] = now
+                self.get_logger().warn(
+                    '第 %d 条 swath 起点 %.1f m 内都贴着障碍（车体转不开），'
+                    '%.1f s 后复查，仍被挡则整段跳过' %
+                    (idx + 1, max_shift,
+                     float(self.get_parameter('entry_confirm_delay').value)))
+                return False
+            waited = (now - since).nanoseconds * 1e-9
+            if waited < float(self.get_parameter('entry_confirm_delay').value):
+                return False
+            self._entry_blocked_since.pop(idx, None)
+            self._entry_checked.add(idx)
+            self.get_logger().warn(
+                '第 %d 条 swath 起点 %.1f m 内都贴着障碍（车体转不开），'
+                '复查 %.1f s 仍被挡，整段跳过' % (idx + 1, max_shift, waited))
+            self._skipped.append({
+                'zone': self._zone_idx,
+                'swath': idx,
+                'from_s': 0.0,
+                'to_s': float(length),
+                'reason': 'entry blocked',
+            })
+            self._publish_blocked(a, b, 0.0, length)
+            self._advance_component()
+            return False
+        self._entry_checked.add(idx)
+        self._entry_blocked_since.pop(idx, None)
+        if chosen <= 1e-3:
+            return True
+        a_new = point_at(a, b, chosen)
+        self._components[idx] = (a_new, b)
+        self.get_logger().warn(
+            '第 %d 条 swath 起点 %.1f m 内有障碍（车体在起点转不开），'
+            '起点沿条带内移 %.2f m 到 (%.2f, %.2f)，放弃端点段 [0, %.2f] m' %
+            (idx + 1, radius, chosen, a_new[0], a_new[1], chosen))
+        return True
+
     def _tick_transit_send(self):
         if self._comp_idx >= len(self._components):
             self._finish_zone()
             return
         pose = self._robot_pose()
         if pose is None:
+            return
+        if not self._entry_adjust():
             return
         a, b = self._components[self._comp_idx]
         dist = math.hypot(pose[0] - a[0], pose[1] - a[1])
@@ -893,6 +1241,10 @@ class CoverageExecutor(Node):
             return
         if detour:
             self._swath_start_s = self._rejoin_s
+        a, b = self._components[self._comp_idx]
+        if self._join_too_sharp(self._result.path, a, b):
+            self._send_nav_fallback()
+            return
         self._start_smooth_follow(self._result.path, self._swath_start_s)
 
     def _send_nav_fallback(self):
@@ -953,8 +1305,22 @@ class CoverageExecutor(Node):
         path = Path()
         path.header.frame_id = self._frame
         path.header.stamp = self.get_clock().now().to_msg()
+        plan_poses = list(plan_path.poses)
+        if shorten and s_from <= 1e-6:
+            # 接近路径若"沿条带线倒着"走进条带起点，拼接后会在起点处形成
+            # 180° 折返（去程和回程压在同一条线上）。DWB 按最近点裁剪全局
+            # 路径，会在重叠的两条腿上反复切换，车原地画圈——实测第 1 段
+            # 转了 190 s，直到 FollowPath 超时才继续。这里把并入点前移到
+            # 接近路径第一次落到条带线上的位置，去掉折返。
+            spur_s, keep = self._plan_spur(plan_poses, a, b)
+            if spur_s > 0.0:
+                plan_poses = plan_poses[:keep]
+                s_from = spur_s
+                self.get_logger().info(
+                    '接近路径沿条带线反向重叠 %.2f m，并入点前移到 '
+                    's=%.2f m 以消除折返' % (spur_s, s_from))
         start = point_at(a, b, s_from)
-        for pose in plan_path.poses:
+        for pose in plan_poses:
             if math.hypot(pose.pose.position.x - start[0],
                           pose.pose.position.y - start[1]) < 0.05:
                 continue
@@ -963,6 +1329,80 @@ class CoverageExecutor(Node):
         path.poses.extend(build_line_path(
             start, point_at(a, b, max(s_from, s_end)), self._frame).poses)
         return path
+
+    def _plan_spur(self, poses, a, b):
+        """检测接近路径末段是否沿条带线、朝条带起点方向重叠。
+
+        返回 (s_join, keep)：s_join > 0 表示并入点应前移到条带上的
+        s_join，接近路径只保留前 keep 个位姿；否则返回 (0.0, len(poses))。
+
+        判据：路径末尾连续落在条带线上（横向偏差 <= 0.12 m），并且这段
+        贴线尾部的投影 s 从 s_join 递减到 0 附近——也就是先沿 +u 方向
+        走过了条带的一部分，再倒着开回起点。合并后条带又从起点沿 +u
+        重新走一遍，形成 180° 折返。
+        """
+        tol = 0.12
+        length = segment_length(a, b)
+        if len(poses) < 5 or length < 1e-3:
+            return 0.0, len(poses)
+        s_list = []
+        lat_list = []
+        for p in poses:
+            px = p.pose.position.x
+            py = p.pose.position.y
+            s, _sc, proj = project_point_on_segment(px, py, a, b)
+            s_list.append(s)
+            lat_list.append(math.hypot(px - proj[0], py - proj[1]))
+        # 接近路径终点就是条带起点，末位姿必须已经贴在条带线上
+        if lat_list[-1] > tol:
+            return 0.0, len(poses)
+        k = len(poses) - 1
+        while k > 0 and lat_list[k - 1] <= tol:
+            k -= 1
+        s_join = s_list[k]
+        if s_join < 0.30 or s_list[-1] > 0.15:
+            return 0.0, len(poses)
+        if s_join - s_list[-1] < 0.30:
+            return 0.0, len(poses)
+        # 并入点前移后仍要留下足够长的条带可跟踪
+        if s_join > length - 0.5:
+            return 0.0, len(poses)
+        return s_join, k + 1
+
+    def _join_too_sharp(self, plan_path, a, b):
+        """接近路径末段方向与条带方向的夹角是否过大（合并即形成尖角）。
+
+        夹角大时合并路径会出现"去程一条腿、条带一条腿"互相抢最近点的
+        情况：车头一拐弯离开条带线，DWB 把最近点判到去程那条腿上，控制器
+        又把它开回尖角，来回画圈。夹角小（从条带后方顺着并入）时没有这种
+        歧义，继续沿用拼接以保证平顺。
+        """
+        poses = plan_path.poses
+        if len(poses) < 2:
+            return False
+        pts = [(p.pose.position.x, p.pose.position.y) for p in poses]
+        # 从终点往回取至少 0.5 m 的窗口估计末段方向（避开终点处的稀疏位姿）
+        acc = 0.0
+        k = len(pts) - 1
+        while k > 0 and acc < 0.5:
+            acc += math.hypot(pts[k][0] - pts[k - 1][0],
+                              pts[k][1] - pts[k - 1][1])
+            k -= 1
+        hx = pts[-1][0] - pts[k][0]
+        hy = pts[-1][1] - pts[k][1]
+        if acc < 0.2 or math.hypot(hx, hy) < 1e-6:
+            return False
+        ux, uy = segment_direction(a, b)
+        diff = abs(normalize_angle(
+            math.atan2(hy, hx) - math.atan2(uy, ux)))
+        limit = float(self.get_parameter('merge_max_join_angle').value)
+        if diff <= limit:
+            return False
+        self.get_logger().warn(
+            '接近路径末段与条带方向夹角 %.0f°（阈值 %.0f°），不拼接成一条 '
+            'FollowPath（尖角处会反复打转），改用 NavigateToPose 到起点/回轨点'
+            % (math.degrees(diff), math.degrees(limit)))
+        return True
 
     def _tick_transit_wait(self):
         if self._pending:
@@ -1026,6 +1466,8 @@ class CoverageExecutor(Node):
     def _tick_exec_send(self):
         if self._comp_idx >= len(self._components):
             self._finish_zone()
+            return
+        if not self._entry_adjust():
             return
 
         a, b = self._components[self._comp_idx]
@@ -1121,6 +1563,8 @@ class CoverageExecutor(Node):
             clear_run=float(self.get_parameter('clear_run').value),
             rejoin_margin=float(self.get_parameter('rejoin_margin').value))
         if rejoin is not None:
+            if self.get_parameter('controller_handles_swath_obstacles').value:
+                return
             self.get_logger().warn(
                 '当前 swath 被挡：s=%.2f m，绕行后回轨点 s=%.2f m' %
                 (s_now, rejoin))
@@ -1199,6 +1643,31 @@ class CoverageExecutor(Node):
         if pose is None:
             return False
         a, b = self._components[self._comp_idx]
+
+        # 机器人离当前条带直线太远 => 这不是"条带被挡"，而是转场/绕行途中
+        # FollowPath 被中止。此时 project() 会把投影夹紧到 0 或 L，若拿它算
+        # 剩余距离，一个离条带 6 m 的机器人会被误判成"已经到条带终点"，
+        # 于是每段都秒跳过（实测 77 s 跳完 21 段）。改为回退到
+        # NavigateToPose 重新去条带起点（带 Nav2 恢复行为），并限制重试次数。
+        lateral = self._point_segment_distance(
+            pose[0], pose[1], a[0], a[1], b[0], b[1])
+        if lateral > float(self.get_parameter('on_line_tolerance').value):
+            self._transit_retries += 1
+            if self._transit_retries > 2:
+                self.get_logger().warn(
+                    '转场重试 %d 次仍未回到第 %d 条 swath，跳过该段' %
+                    (self._transit_retries, self._comp_idx + 1))
+                self._skip_remaining('transit retries exhausted',
+                                     use_projection=False)
+                return True
+            self.get_logger().warn(
+                '机器人距第 %d 条 swath 还有 %.2f m，重新转场（%d/2）' %
+                (self._comp_idx + 1, lateral, self._transit_retries))
+            if not self._done:
+                self._cancel_active()
+            self._send_transit_nav()
+            return True
+
         s_now = self._supervisor.project(pose[0], pose[1], a, b)
         remain = segment_length(a, b) - s_now
         if remain <= float(self.get_parameter('end_stall_tolerance').value):
@@ -1300,6 +1769,38 @@ class CoverageExecutor(Node):
 
     def _begin_detour(self, rejoin_s):
         max_detours = int(self.get_parameter('max_detours_per_swath').value)
+
+        # 秒 abort 识别：控制器 1 s 内就把刚发出的 FollowPath 中止，说明车
+        # 根本没起步（典型是局部代价地图在 footprint 内标了障碍，419 条采样
+        # 轨迹全判碰撞）。这种 abort 换回轨点也救不回来，还会在 1.5 s 内把
+        # max_detours 烧光、整段跳过。改为退回 NavigateToPose：BT 会在
+        # FollowPath 失败时 ClearEntireCostmap（清掉误标/残留栅格），这是
+        # 执行器直连 FollowPath 时拿不到的恢复能力。
+        if (self._active_kind == 'follow' and self._done and
+                self._goal_elapsed() < float(
+                    self.get_parameter('detour_min_elapsed').value)):
+            self._quick_aborts += 1
+        else:
+            self._quick_aborts = 0
+
+        if self._quick_aborts >= 2:
+            self._quick_aborts = 0
+            if self._transit_retries < 2:
+                self._transit_retries += 1
+                self.get_logger().warn(
+                    '控制器连续秒 abort（无法起步），改用 NavigateToPose '
+                    '脱困并清理代价地图（%d/2）' % self._transit_retries)
+                self._rejoin_s = float(rejoin_s)
+                a, b = self._components[self._comp_idx]
+                self._publish_rejoin(a, b, rejoin_s)
+                if not self._done:
+                    self._cancel_active()
+                self._send_detour_nav()
+                return
+            self.get_logger().warn('脱困重试耗尽，跳过本段剩余轨迹')
+            self._skip_remaining('controller cannot start')
+            return
+
         if self._detour_count >= max_detours:
             self._skip_remaining('max detours reached')
             return
@@ -1395,6 +1896,7 @@ class CoverageExecutor(Node):
         self._comp_idx += 1
         self._swath_start_s = 0.0
         self._detour_count = 0
+        self._quick_aborts = 0
         self._detour_guard_s = None
         self._transit_retries = 0
         self._stall_fallbacks = 0
@@ -1407,8 +1909,18 @@ class CoverageExecutor(Node):
         if use_projection:
             pose = self._robot_pose()
             if pose is not None:
-                s_now = self._supervisor.project(pose[0], pose[1], a, b)
-                s_from = max(s_now, s_from)
+                # 只有机器人确实在这条条带上时，投影才有意义。离线的车
+                # 投影会被夹紧到 0/L，记下来的"剩余段"就是假的。
+                lateral = self._point_segment_distance(
+                    pose[0], pose[1], a[0], a[1], b[0], b[1])
+                if lateral <= float(
+                        self.get_parameter('on_line_tolerance').value):
+                    s_now = self._supervisor.project(pose[0], pose[1], a, b)
+                    s_from = max(s_now, s_from)
+                else:
+                    self.get_logger().warn(
+                        '机器人离线 %.2f m，跳过记录按段起点 %.2f m 计' %
+                        (lateral, s_from))
         self._skipped.append({
             'zone': self._zone_idx,
             'swath': self._comp_idx,
@@ -1426,6 +1938,7 @@ class CoverageExecutor(Node):
         self._comp_idx = 0
         self._swath_start_s = 0.0
         self._detour_count = 0
+        self._quick_aborts = 0
         self._detour_guard_s = None
         if self._zone_idx + 1 < len(self._zones):
             self._zone_idx += 1
@@ -1522,6 +2035,7 @@ class CoverageExecutor(Node):
         if not holes:
             return swaths
         clearance = float(self.get_parameter('hole_clearance').value)
+        end_clearance = float(self.get_parameter('hole_end_clearance').value)
         min_len = float(self.get_parameter('min_swath_length').value)
         step = 0.05
         clipped = []
@@ -1549,6 +2063,13 @@ class CoverageExecutor(Node):
             if run_start is not None:
                 runs.append((run_start, last_ok))
             for s0, s1 in runs:
+                # 被孔洞截出的端点（不在 swath 本身上）沿 swath 方向再退
+                # hole_end_clearance：停在断点时车体中心离柱子还有余量，
+                # 车头/车尾才不会伸进孔洞。swath 的真实两端不动。
+                if s0 > 1e-6:
+                    s0 = min(s0 + end_clearance, s1)
+                if s1 < length - 1e-6:
+                    s1 = max(s1 - end_clearance, s0)
                 if s1 - s0 < min_len:
                     continue
                 clipped.append(
@@ -1581,6 +2102,10 @@ class CoverageExecutor(Node):
                 self._frame, self._base_frame, Time())
         except Exception:
             return None
+        # 记下 TF 链的实际时间戳：map->base_link 是由 map->odom 与
+        # odom->base_link 组合出来的，"最新时间"取两者的较小值——FAST-LIO
+        # 或重定位任一侧停更，这个戳就停在原处，用它做停更检测。
+        self._last_tf_stamp = tf.header.stamp
         t = tf.transform.translation
         q = tf.transform.rotation
         return (t.x, t.y, quaternion_to_yaw(q))

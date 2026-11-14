@@ -21,7 +21,7 @@
 
 ## 1. 项目总览
 
-**技术栈**：ROS2 Humble + Gazebo Classic（gzserver/gzclient）+ FAST-LIO（LiDAR+IMU 紧耦合里程计）+ fastlio_localization（3D 点云重定位）+ Nav2（MPPI / Navfn）。AMCL 与 robot_localization EKF 均已移除。
+**技术栈**：ROS2 Humble + Gazebo Classic（gzserver/gzclient）+ FAST-LIO（LiDAR+IMU 紧耦合里程计）+ fastlio_localization（3D 点云重定位）+ Nav2（DWB/DWA 局部规划器 + Navfn 全局规划器）。AMCL 与 robot_localization EKF 均已移除。
 
 **目录结构**（工作区 `src/`）：
 
@@ -352,7 +352,7 @@ free_thresh: 0.25
 | `map_server` | — | 读取 `my_map.yaml`，发布 `/map`（静态地图，只给 global_costmap） |
 | `fastlio_relocalization` | 3D ICP | 用 `/cloud_registered` + 先验 PCD 定位，发布 `map→odom` TF |
 | `planner_server` | NavfnPlanner | 全局路径规划（在全局代价地图上 A*/Dijkstra） |
-| `controller_server` | MPPI | 局部路径跟踪，输出速度指令 |
+| `controller_server` | DWB（DWA） | 局部路径跟踪，输出速度指令 |
 | `smoother_server` | SimpleSmoother | 平滑全局路径 |
 | `behavior_server` | spin/backup/wait 等 | 恢复行为（卡住时后退/旋转） |
 | `bt_navigator` | 行为树 | 编排整个导航流程 |
@@ -429,7 +429,7 @@ controller_server ──/cmd_vel_nav──► velocity_smoother ──/cmd_vel�
 behavior_server(恢复行为) ──────────────────/cmd_vel──► diff_drive
 ```
 
-- `controller_server` 发布 **`/cmd_vel_nav`**（MPPI 原始输出）；
+- `controller_server` 发布 **`/cmd_vel_nav`**（DWB 原始输出）；
 - `velocity_smoother` 订阅 `/cmd_vel_nav`，做加减速限幅后发布 **`/cmd_vel`**；
 - `behavior_server` 的恢复行为（spin/backup 等）**直接发布 `/cmd_vel`**，绕过 smoother；
 - Gazebo 里的 `diff_drive` 订阅 **`/cmd_vel`**。
@@ -440,7 +440,7 @@ behavior_server(恢复行为) ────────────────�
 2. `bt_navigator` 调 `planner_server` 的 `ComputePathToPose`；
 3. `planner_server` 在 `global_costmap` 上规划出全局路径 → 返回 `bt_navigator`；
 4. `bt_navigator` 把路径通过 `FollowPath` action 发给 `controller_server`；
-5. `controller_server`（MPPI）结合 `local_costmap` 和路径，计算出速度指令 → `/cmd_vel_nav`；
+5. `controller_server`（DWB）结合 `local_costmap` 和路径，计算出速度指令 → `/cmd_vel_nav`；
 6. `velocity_smoother` 平滑限幅 → `/cmd_vel`；
 7. Gazebo `diff_drive` 执行速度，机器人移动；
 8. 轮子转动 → `/joint_states`；IMU → `/livox/imu`；雷达 → `/livox/lidar`；
@@ -519,29 +519,26 @@ WAIT_READY → START_NAV_SEND/WAIT
     连接；下一条 swath 从半圆终点对应的 `s` 开始跟踪，端头那一小段由
     半圆扫过的 0.8 m 清洗带覆盖。这样弧顶只到"提前停轨点 − 0.4 m"，
     距条带端点还有余量，既不贴墙也不进膨胀层；曲率恒定，比贝塞尔更容易
-    让 MPPI 平稳跟随。横向间距 < 0.7 m（半径低于最小转弯半径）时自动
+    让控制器平稳跟随。横向间距 < 0.7 m（半径低于最小转弯半径）时自动
     退回贝塞尔换轨。
-  - **掉头速度调参**（`nav2_params.yaml` 的 `vx_std=0.4`、`wz_std=0.8`）：
-    实测掉头曾慢到 16 s 才走完 1.26 m 半圆（均速 0.078 m/s）。链路记录确认
-    是 MPPI 自己只下发 `nav_v≈0、nav_w≈0.10 rad/s`，底盘与代价地图正常
-    （全局代价地图沿半圆全为 0）。根因是采样标准差过小：半圆要求持续
-    `vx≈0.5、wz≈1.25`，对应 2.5σ/3.1σ，白噪声采样几乎不可能生成一条全程
-    跟住半圆的轨迹；而横向偏差惩罚（PathAlign 权重 14）在"停在弧线起点"
-    时为 0，softmax 加权平均于是收敛到"原地极慢转"。放大采样标准差后
-    半圆轨迹进入采样集，掉头耗时降到约 4 s（均速 0.31 m/s）。实测直线段
-    横向偏差 rms 仅 0.01 m，条带跟踪精度不受影响；调 PathAlign/PathFollow
-    权重无效，故未改动。
+  - **掉头速度**：局部规划器已从 MPPI 换成 DWB（DWA）。MPPI 时期掉头曾慢到
+    16 s 才走完 1.26 m 半圆（均速 0.078 m/s），根因是采样标准差过小——半圆
+    要求持续 `vx≈0.5、wz≈1.25`，对应 2.5σ/3.1σ，白噪声几乎采不出能跟住
+    半圆的轨迹，softmax 加权平均退化成"原地极慢转"；当时靠把 `vx_std/wz_std`
+    放大到 0.4/0.8 才降到约 4 s。DWB 的速度采样是均匀网格（0.5/19≈0.026 m/s、
+    3.8/19≈0.20 rad/s），不存在采样不到的问题，`max_vel_theta=1.9` 足以覆盖
+    半径 0.4 m 半圆所需的 1.25 rad/s。
   - 距离 > `arc_connector_max_length`（3.0 m，TSP 跨区跳跃）或弧线不可行时，
     回退到下面的规划器转场；
 - **规划器平滑转场**（`smooth_transit=true`，回退）：`TRANSIT_SEND` 调用
   planner_server 的 `compute_path_to_pose`（`use_start=false`，NavFn，
   实测 0.05~0.1 s）规划一条到条带起点的路径，再把从起点到终点的条带按
   0.1 m 间隔拼到路径末尾，**只发一条 `FollowPath`**（`coverage_goal_checker`）。
-  MPPI 在路径拐点处沿切线自然并入条带，全程没有停车转向。
+  DWB 沿路径拐点自然并入条带，全程没有停车转向。
   - 规划失败/超时（`plan_timeout=10 s`）自动回退 `NavigateToPose`
     （`general_goal_checker` 0.6 m / 0.6 rad）；
   - 距离小于 `transit_tolerance`（0.6 m）时仍跳过转场，直接交给
-    `FollowPath` 顺带走过去——实测 MPPI 在"小距离 + 大角度"终点会反复
+    `FollowPath` 顺带走过去——实测（MPPI 时期）在"小距离 + 大角度"终点会反复
     触发进度检查失败；
   - 合并路径前半段是转场，机器人可能离当前条带很远：只有横向距离
     ≤ `on_line_tolerance`（1.0 m）才做前视障碍/停滞检查，避免把转场
@@ -549,7 +546,7 @@ WAIT_READY → START_NAV_SEND/WAIT
     `NavigateToPose`，连续两次则跳过该条带;
 - **逐条跟踪**：`FollowPath` + `coverage_goal_checker`（0.12 m / 0.10 rad），
   BT 里必须显式写 `goal_checker_id`（有两个 goal checker 时空字符串会报错）。
-  终点容差 0.12 m：条带终点离墙只有约 0.3 m，MPPI 在膨胀层附近压不进 5 cm，
+  终点容差 0.12 m：条带终点离墙只有约 0.3 m，控制器在膨胀层附近压不进 5 cm，
   实测每条 swath 都在终点 0.07~0.10 m 处停住，5 s 后被"进度停滞"兜底误判成
   绕行（多花 5 s 且发出一条假的 `blocked_interval`）；
 - **避障回轨**：见下节。
@@ -598,7 +595,7 @@ WAIT_READY → START_NAV_SEND/WAIT
 `0.1 m / 0.15 rad / 5 s` 的停滞检测兜住，此时用 `find_free_ahead`
 在前方 2.5 m 内找一个可通行点作为绕行目标，然后同样回轨。若停滞/失败点
 距条带终点 ≤ `end_stall_tolerance`（1 m），不再绕行，直接结束该段：
-条带终点离墙约 0.3 m，MPPI 在膨胀层附近压不进 0.12 m 的终点容差，
+条带终点离墙约 0.3 m，控制器在膨胀层附近压不进 0.12 m 的终点容差，
 否则会在段末反复"停滞 → 回轨到同一点"（实测每次白耗几十秒）。
 
 **定位跳变保护**：执行器每个 tick 检查 `map→base_link`，相邻 tick（≤1 s）
@@ -787,5 +784,5 @@ local_costmap ──────────────────────
 3. **地图加载**：map_server（延迟 5 s 由 lifecycle manager 激活）发布 `/map`；重定位节点加载 `prior_3d_map.pcd` 并先发单位阵 `map→odom`。
 4. **初始定位**：`relocalize_on_start: true`，重定位节点自动做一次全局搜索 + ICP，成功后开始发真实 `map→odom`——**无需在 RViz 手动给初始位姿**。
 5. **下发目标**：RViz "2D Nav Goal" → bt_navigator 开始规划与跟踪。
-6. **运动闭环**：规划 → MPPI 跟踪 → 速度指令 → 机器人移动 → LiDAR/IMU 回传 → FAST-LIO 更新 `odom→base_link` → 重定位节点更新 `map→odom` → 代价地图更新 → 直到到达目标。
+6. **运动闭环**：规划 → DWB 跟踪 → 速度指令 → 机器人移动 → LiDAR/IMU 回传 → FAST-LIO 更新 `odom→base_link` → 重定位节点更新 `map→odom` → 代价地图更新 → 直到到达目标。
 7. **跟踪丢失**：若连续 5 帧 ICP 内点率不足，节点自动重新全局搜索；也可手动调用 `/relocalize`。

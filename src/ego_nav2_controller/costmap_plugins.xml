@@ -1,0 +1,5 @@
+<library path="ego_controller">
+  <class name="ego_nav2_controller::ObstacleMemory" type="ego_nav2_controller::ObstacleMemory" base_class_type="nav2_costmap_2d::Layer">
+    <description>Retain nearby lethal observations in odom across sensor blind spots.</description>
+  </class>
+</library>

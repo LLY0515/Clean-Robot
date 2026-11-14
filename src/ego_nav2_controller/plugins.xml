@@ -1,0 +1,5 @@
+<library path="ego_controller"><class name="ego_nav2_controller::EgoController" type="ego_nav2_controller::EgoController" base_class_type="nav2_core::Controller"><description>EGO 2D optimization with differential drive tracking and footprint checks.</description></class><class name="ego_nav2_controller::ClearanceSpin" type="ego_nav2_controller::ClearanceSpin" base_class_type="nav2_core::Behavior"/>
+<class name="ego_nav2_controller::ClearanceBackUp" type="ego_nav2_controller::ClearanceBackUp" base_class_type="nav2_core::Behavior"/>
+<class name="ego_nav2_controller::ClearanceDrive" type="ego_nav2_controller::ClearanceDrive" base_class_type="nav2_core::Behavior"/>
+<class name="ego_nav2_controller::ExactGoalLattice" type="ego_nav2_controller::ExactGoalLattice" base_class_type="nav2_core::GlobalPlanner"/>
+</library>

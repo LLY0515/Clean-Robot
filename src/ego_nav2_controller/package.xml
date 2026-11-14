@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>ego_nav2_controller</name><version>0.1.0</version>
+  <description>EGO 2D local optimization and differential drive tracking for the MID360 Nav2 workspace.</description>
+  <maintainer email="robot@example.com">Robot maintainers</maintainer><license>MIT</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>nav2_behaviors</depend><depend>nav2_msgs</depend><depend>nav2_core</depend><depend>nav2_costmap_2d</depend><depend>nav2_util</depend>
+  <depend>rclcpp</depend><depend>rclcpp_lifecycle</depend><depend>pluginlib</depend>
+  <depend>tf2_geometry_msgs</depend><depend>tf2_ros</depend><depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend><depend>eigen</depend>
+  <depend>nav2_smac_planner</depend>
+  <test_depend>ament_cmake_gtest</test_depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

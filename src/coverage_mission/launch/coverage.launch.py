@@ -54,6 +54,13 @@ def generate_launch_description():
                 'autostart': autostart,
                 'node_names': ['coverage_server'],
                 'bond_timeout': 10.0,
+                # 【修复偶发任务失败】coverage_server 的 configure 回调要初始化
+                # Fields2Cover（约 1.1 s），实测偶发报
+                # "failed to send response to /coverage_server/change_state
+                #  (timeout)"，管理器没继续 activate，coverage_server 停在
+                # inactive，执行器随后 "覆盖规划 action 失败：status=0" 终止
+                # 任务（run14）。把服务超时放宽到 30 s 兜住这个慢回调。
+                'service_timeout': 30.0,
             }],
         )],
     )

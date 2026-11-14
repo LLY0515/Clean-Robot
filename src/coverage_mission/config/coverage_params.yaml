@@ -52,7 +52,7 @@ coverage_executor:
     # 转场
     # 小于 0.6 m 的转场直接跳过 NavigateToPose，交给接下来的 FollowPath
     # 顺带走过去。0.3 m 时经常出现"离 swath 起点只剩 0.5 m"还要发一次
-    # NavigateToPose 的情况，而 MPPI 在小距离+大角度修正时最容易触发
+    # NavigateToPose 的情况，而旧的 MPPI 局部规划器在小距离+大角度修正时最容易触发
     # 进度检查失败，白白浪费 120 s 超时。
     transit_tolerance: 0.6
     coverage_goal_checker: coverage_goal_checker
@@ -63,6 +63,23 @@ coverage_executor:
     # 规划失败/超时会自动回退到 NavigateToPose（带 Nav2 恢复行为）。
     smooth_transit: true
     plan_timeout: 10.0
+    # 并入角保护：接近路径末段方向与条带方向的夹角超过该值（弧度）时，
+    # 不把"转场 + 条带"拼成一条 FollowPath，而是 NavigateToPose 到条带
+    # 起点/回轨点（到位后原地转向），条带仍是一条直线。
+    # 夹角大（如 133°）的拼接处是一个尖角：DWB 按最近点裁剪全局路径，
+    # 车头一拐弯离开条带线最近点就跳回"去起点"那条腿，控制器又把它开回
+    # 尖角，实测在原地来回画圈 190 s，最后靠 FollowPath 超时脱身。
+    merge_max_join_angle: 1.0
+    # 条带起点可站立性：车体半对角线 0.77 m，端头离墙太近时在起点转身会
+    # 扫到障碍，既转不开也退不出（不许倒车）。要求起点周围这么多米内没有
+    # 致命栅格；不满足就把起点沿条带方向内移，最多 entry_max_shift 米，
+    # 内移上限内仍站不住则整段跳过。
+    entry_clearance: 0.95
+    entry_max_shift: 2.0
+    # 整段跳过确认：单帧代价地图可能因为定位抖动、点云补全滞后临时
+    # "看不见"站得下的位置。首次判成整段跳过只记下时间，等这么多秒后
+    # 复查仍被挡才真正跳过（run47 第 33 条在 FAST-LIO 不稳定窗口里被误判）。
+    entry_confirm_delay: 1.5
     # 离条带直线横向多近才做前视障碍/停滞检查（转场段不检查，避免把
     # 转场路径旁的柱子误判成当前条带被挡）。
     on_line_tolerance: 1.0
@@ -98,7 +115,7 @@ coverage_executor:
     # 障碍检查：沿当前 swath 前视 3 m。
     # corridor_half_width 只取 0.25 m：区域多边形本身已离墙 0.55 m，
     # 走廊再宽就会把"路边的墙"误判成障碍，导致每条靠墙 swath 都触发绕行。
-    # 凸出轨道 0.25 m 以上的障碍才需要整条轨道绕行，更小的由 MPPI 自行避让。
+    # 凸出轨道 0.25 m 以上的障碍才需要整条轨道绕行，更小的由局部规划器（现为 DWB）自行避让。
     lookahead: 3.0
     corridor_half_width: 0.25
     footprint_radius: 0.30
@@ -115,13 +132,24 @@ coverage_executor:
     clear_run: 1.4
     rejoin_margin: 1.3
     max_detours_per_swath: 3
+    # 条带上的单个障碍交给控制器绕行（ego_nav2_controller 平滑绕行参考）：
+    # 控制器贴着原航线走到障碍物前约 0.7 m 才横移，保持横向偏移一直到
+    # **车尾**越过障碍，再平滑回轨。执行器的"绕行后回轨"会取消 FollowPath，
+    # 让规划器按最短路径贴膨胀层斜切回条带，车尾还没越过就开始回轨——
+    # 实测车尾角点离 0.5 m 箱子只剩 0.14 m（用户反馈"车屁股摆尾容易撞到
+    # 障碍物"）。置 true 后单个障碍不再触发执行器绕行；密集障碍区整段
+    # 跳扫、找不到回轨点跳过剩余段、进度停滞兜底等逻辑不受影响。
+    controller_handles_swath_obstacles: true
+    # FollowPath 在这段时间内就 abort => 控制器没起步（位姿被判碰撞），
+    # 不算一次绕行，连续两次改用 NavigateToPose 脱困（BT 会清代价地图）。
+    detour_min_elapsed: 1.0
 
     # 进度监控（代价地图看不到的卡死/阻挡）
     stall_distance: 0.1
     stall_yaw_delta: 0.15
     stall_time: 5.0
     # 停滞/失败点距条带终点小于该值时直接结束该段，不再绕行回轨。
-    # 条带终点离墙约 0.3 m，MPPI 在膨胀层附近压不进 0.12 m 的终点容差，
+    # 条带终点离墙约 0.3 m，旧的 MPPI 在膨胀层附近压不进 0.12 m 的终点容差，
     # 实测会在段末反复"停滞 -> 回轨到同一点"，每次白耗几十秒。
     end_stall_tolerance: 1.0
 
@@ -149,19 +177,33 @@ coverage_executor:
     # 规划忽略孔洞得到整场统一网格后，条带会直接穿过柱子/结构物；执行时在
     # 孔洞边界外 hole_clearance 处断开、逐段执行（段内 FollowPath，段间
     # NavigateToPose 绕过去），比"开到跟前再临时绕行"稳定得多。
-    # 区域多边形已让孔洞比真实障碍物外扩约 0.55 m，再加 0.15 m，车头
-    # （前伸 0.545 m）停在断点处仍有约 0.15 m 余量。
+    # 区域多边形已让孔洞比真实障碍物外扩约 0.55 m。注意 hole_clearance 只是
+    # "横向别贴着柱子"的余量，它管不了车头：车体中心停在断点上时，车头已经
+    # 前伸 0.55 m（footprint 前角 0.665 m），必然扫进孔洞。实测第 16 段
+    # 断在柱子前 0.15 m，DWB 的 ObstacleFootprint 判定当前位姿已碰撞，
+    # 419 条采样轨迹全废、控制器 patience 超时、车永久卡死。
+    # 所以孔洞截出来的端点还要沿 swath 方向再退 hole_end_clearance。
     # 【实测】run10 第 12 条 swath 直接穿过西北角噪声/障碍密集区，MPPI
     # 无可行轨迹、FAST-LIO 随后发散把位姿飘到几十米外，任务终止。
     # 裁剪后该区域整段跳过（本图 23 条 -> 37 段，总长 326.8 -> 282.3 m）。
     clip_swaths_at_holes: true
     hole_clearance: 0.15
+    # 车头 0.55 m + 0.05 m 余量。只缩短被孔洞截出的端点，swath 真实两端
+    # 仍只受 swath_end_trim 约束。
+    hole_end_clearance: 0.60
 
     # 定位跳变保护：相邻 tick 位姿跳变超过 pose_jump_limit，或跑出所有
     # 分区包围盒外 pose_sanity_margin 米，就取消当前 goal 并终止任务。
     # 宁可停车重定位，也不能用发散位姿盲开。
     pose_jump_limit: 5.0
     pose_sanity_margin: 5.0
+    # 里程计停更保护：map->base_link 时间戳超过 pose_stale_timeout 秒没有
+    # 更新（FAST-LIO 或 3D 重定位停更），先请求一次 /relocalize；宽限期
+    # pose_stale_grace 秒内仍没有新位姿就终止任务并停车。
+    # 【实测】run47 末尾 FAST-LIO 停更，位姿冻结（不跳变、不越界），旧逻辑
+    # 发现不了，任务卡在"转场->Goal failed->重试"循环里无法自愈。
+    pose_stale_timeout: 5.0
+    pose_stale_grace: 20.0
 
     # 透传给 ComputeCoveragePath 的规划参数
     #
